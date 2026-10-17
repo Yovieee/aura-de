@@ -1,0 +1,13 @@
+[package]
+name = "aura-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Liquid Glass WGSL/GLES3 refractive shaders and Dual-Kawase blur pyramid for Aura DE"
+
+[dependencies]
+aura-core = { path = "../aura-core" }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+wgpu = { workspace = true }
