@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aura-core",
+    "crates/aura-render",
+    "crates/aura-compositor",
+    "crates/aura-shell",
+    "crates/aura-launcher",
+    "crates/aura-session",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Yovieee/aura-de"
+
+[workspace.dependencies]
+# Core Wayland & Compositor Stack
+smithay = { version = "0.7.0", default-features = false, features = [
+    "backend_winit",
+    "backend_drm",
+    "backend_gbm",
+    "backend_egl",
+    "backend_libinput",
+    "backend_session_libseat",
+    "renderer_gl",
+    "renderer_multi",
+    "wayland_frontend",
+    "desktop",
+] }
+calloop = { version = "0.14.0", features = ["executor"] }
+wayland-server = "0.31.10"
+wayland-client = "0.31.10"
+wayland-protocols = { version = "0.32.8", features = ["server", "client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3.8", features = ["server", "client"] }
+smithay-client-toolkit = { version = "0.21.1", default-features = false, features = ["calloop"] }
+
+# GPU & Shader Pipeline
+wgpu = "26.0.1"
+iced = { version = "0.14.0", features = ["wgpu", "tokio"] }
+bytemuck = { version = "1.21.0", features = ["derive"] }
+glam = "0.29.2"
+
+# System IPC, Media & Session Daemons
+zbus = { version = "5.5.0", default-features = false, features = ["tokio"] }
+pipewire = "0.10.1"
+tokio = { version = "1.43.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+# Serialization & Diagnostics
+serde = { version = "1.0.217", features = ["derive"] }
+toml = "0.8.20"
+thiserror = "2.0.11"
+tracing = { version = "0.1.41" }
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+bitflags = "2.8.0"

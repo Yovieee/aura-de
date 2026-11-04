@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#070B19"/>
+      <stop offset="50%" stop-color="#0F172A"/>
+      <stop offset="100%" stop-color="#1E1B4B"/>
+    </linearGradient>
+    <radialGradient id="orbCyan" cx="22%" cy="28%" r="40%">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="orbPurple" cx="78%" cy="32%" r="42%">
+      <stop offset="0%" stop-color="#C084FC" stop-opacity="0.50"/>
+      <stop offset="100%" stop-color="#C084FC" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="glassSurface" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.28"/>
+      <stop offset="50%" stop-color="#F0F6FF" stop-opacity="0.14"/>
+      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0.10"/>
+    </linearGradient>
+    <linearGradient id="glassRim" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.75"/>
+      <stop offset="50%" stop-color="#FFFFFF" stop-opacity="0.20"/>
+      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0.45"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="900" fill="url(#bgGrad)"/>
+  <circle cx="360" cy="260" r="340" fill="url(#orbCyan)"/>
+  <circle cx="1240" cy="290" r="360" fill="url(#orbPurple)"/>
+  <rect x="0" y="0" width="1600" height="34" fill="#0F172A" fill-opacity="0.55" stroke="#FFFFFF" stroke-opacity="0.22"/>
+  <text x="20" y="22" fill="#FFFFFF" font-family="sans-serif" font-size="13" font-weight="bold">Aura DE   Stage Manager   File   Edit   View   Window</text>
+  <text x="1310" y="22" fill="#E2E8F0" font-family="sans-serif" font-size="13">PipeWire   Liquid Glass   Sat 13:18</text>
+  <rect x="24" y="84" width="196" height="124" rx="22" fill="url(#glassSurface)" stroke="url(#glassRim)" stroke-width="1.5"/>
+  <text x="44" y="118" fill="#FFFFFF" font-family="sans-serif" font-size="13" font-weight="bold">Aura Files</text>
+  <rect x="24" y="228" width="196" height="124" rx="22" fill="url(#glassSurface)" stroke="url(#glassRim)" stroke-width="1.5"/>
+  <text x="44" y="262" fill="#FFFFFF" font-family="sans-serif" font-size="13" font-weight="bold">Wayland Explorer</text>
+  <rect x="256" y="64" width="960" height="700" rx="24" fill="#0F172A" fill-opacity="0.68" stroke="url(#glassRim)" stroke-width="1.8"/>
+  <circle cx="282" cy="86" r="6" fill="#FF5F56"/>
+  <circle cx="302" cy="86" r="6" fill="#FFBD2E"/>
+  <circle cx="322" cy="86" r="6" fill="#27C93F"/>
+  <text x="560" y="90" fill="#F8FAFC" font-family="sans-serif" font-size="13" font-weight="bold">crates/aura-render/shaders/liquid_glass.wgsl — Aura Studio</text>
+  <rect x="1244" y="54" width="332" height="360" rx="24" fill="url(#glassSurface)" stroke="url(#glassRim)" stroke-width="1.8"/>
+  <text x="1268" y="88" fill="#FFFFFF" font-family="sans-serif" font-size="14" font-weight="bold">Liquid Glass Optical Control Center</text>
+  <rect x="510" y="806" width="580" height="76" rx="26" fill="url(#glassSurface)" stroke="url(#glassRim)" stroke-width="2"/>
+  <rect x="536" y="818" width="52" height="52" rx="14" fill="#38BDF8"/>
+  <rect x="602" y="812" width="60" height="60" rx="15" fill="#818CF8"/>
+  <rect x="676" y="800" width="74" height="74" rx="18" fill="#0EA5E9"/>
+  <rect x="764" y="792" width="84" height="84" rx="20" fill="#38BDF8"/>
+  <rect x="862" y="800" width="74" height="74" rx="18" fill="#F43F5E"/>
+  <rect x="950" y="812" width="60" height="60" rx="15" fill="#EC4899"/>
+  <rect x="1024" y="818" width="52" height="52" rx="14" fill="#64748B"/>
+</svg>
