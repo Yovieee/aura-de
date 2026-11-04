@@ -19,6 +19,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install host dependencies
         run: sudo bash scripts/install-deps.sh --native --testing
+      - name: Verify X11 keyboard runtime
+        run: python3 -c 'import ctypes; ctypes.CDLL("libxkbcommon-x11.so.0")'
       - name: Install pinned Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2

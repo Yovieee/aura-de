@@ -20,8 +20,10 @@ for argument in "$@"; do
     esac
 done
 
+# winit loads the X11 keyboard library at runtime; libxkbcommon-dev does not provide it.
 packages=(build-essential pkg-config python3 curl ca-certificates
-          libwayland-dev libegl1-mesa-dev libgles2-mesa-dev libxkbcommon-dev)
+          libwayland-dev libegl1-mesa-dev libgles2-mesa-dev
+          libxkbcommon-dev libxkbcommon-x11-0)
 if "$native"; then
     packages+=(libdrm-dev libgbm-dev libinput-dev libseat-dev libudev-dev libpipewire-0.3-dev)
 fi
