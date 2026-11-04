@@ -31,11 +31,8 @@ void main() {
     float dist = squircle_sdf(local_p, half_extents, radius);
     float edge_alpha = 1.0 - smoothstep(-0.75, 0.75, dist);
 
-    if (edge_alpha <= 0.001) {
-        float shadow = 0.28 * exp(-max(dist, 0.0) / max(u_bevel_and_specular.w, 8.0));
-        frag_color = vec4(0.0, 0.0, 0.0, shadow);
-        return;
-    }
+    float shadow = 0.28 * exp(-max(dist, 0.0) / max(u_bevel_and_specular.w, 8.0));
+    float final_alpha = edge_alpha + shadow * (1.0 - edge_alpha);
 
     float bevel_t = clamp((dist + bevel_width) / bevel_width, 0.0, 1.0);
     float theta = bevel_t * 1.287;
@@ -67,5 +64,8 @@ void main() {
     float rim = (fresnel * 0.55 + spec_lobe * 0.85) * u_bevel_and_specular.z;
 
     vec3 tinted = mix(backdrop_rgb, u_tint_rgba.rgb, u_tint_rgba.a);
-    frag_color = vec4(clamp(tinted + vec3(rim), 0.0, 1.0), edge_alpha);
+    if (ior == 1.0 && dispersion == 0.0) {
+        tinted = u_tint_rgba.rgb;
+    }
+    frag_color = vec4(max(tinted + vec3(rim), 0.0) * edge_alpha, final_alpha);
 }

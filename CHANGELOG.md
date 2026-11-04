@@ -4,6 +4,25 @@ All notable changes to the **Aura Desktop Environment (`aura-de`)** project are 
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Real nested Smithay Wayland server, layer-shell clients, XDG application launching, D-Bus notifications and process supervision.
+- Executable wgpu and GLES Liquid Glass passes, real scene capture, opaque fallback and driver/readback checks.
+- Regression coverage for focus, minimize/restore, stall-safe springs, invalid materials, remap/maximize/popups and layer reservation cleanup.
+- End-to-end headless input/session tests, development packaging and verified rootless Debian dependency setup.
+
+### Changed
+
+- Pin the development toolchain, retain application dependency locking, and add CI plus Debian/Ubuntu host setup instructions.
+- Replace the previous mathematical demonstration's smoke claims with a real nested Wayland client test harness.
+- Track implemented behavior and observed validation separately in `docs/implementation-status.md`; native DRM/KMS and actual PipeWire capture require their own acceptance evidence.
+
+### Documentation correction
+
+The `0.1.0` entries below record the initial design/model slices. They did not constitute verified runtime support for a compositor, graphical shell, hardware session or screencast portal. Refer to the current implementation status rather than treating those historical descriptions as feature guarantees.
+
 ## [0.1.0] - 2026-10-17
 
 ### Added

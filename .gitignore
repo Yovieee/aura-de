@@ -1,8 +1,11 @@
 # Rust / Cargo build artifacts
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # Local environment overrides
 .env
 .DS_Store
+
+# Python helper caches
+__pycache__/
+*.pyc

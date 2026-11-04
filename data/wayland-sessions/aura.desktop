@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Aura (Nested Preview)
+Comment=Aura nested Wayland development session; requires an existing graphical host
+Exec=aura-session --backend winit
+TryExec=aura-session
+Type=Application
+DesktopNames=Aura;

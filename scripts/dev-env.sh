@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Source this file when using a user-local native dependency sysroot.
+# Normal system package installations do not need it.
+aura_cloud_setup="${AURA_CLOUD_SETUP_ROOT:-/workspace/.cloud-setup}"
+if [[ -x "$aura_cloud_setup/cargo/bin/cargo" && -d "$aura_cloud_setup/rustup" ]]; then
+    export CARGO_HOME="${CARGO_HOME:-$aura_cloud_setup/cargo}"
+    export RUSTUP_HOME="${RUSTUP_HOME:-$aura_cloud_setup/rustup}"
+    export PATH="$CARGO_HOME/bin:$PATH"
+fi
+unset aura_cloud_setup
+if [[ -n "${AURA_SYSROOT:-}" ]]; then
+    aura_sysroot_prefix="${AURA_SYSROOT%/}/usr"
+    aura_triplet="$(cc -dumpmachine)"
+    export PKG_CONFIG_PATH="$aura_sysroot_prefix/lib/$aura_triplet/pkgconfig:$aura_sysroot_prefix/lib/pkgconfig:$aura_sysroot_prefix/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    export LIBRARY_PATH="$aura_sysroot_prefix/lib/$aura_triplet:$aura_sysroot_prefix/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+    export LD_LIBRARY_PATH="$aura_sysroot_prefix/lib/$aura_triplet:$aura_sysroot_prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export PATH="$aura_sysroot_prefix/bin:$PATH"
+    if [[ -f "$aura_sysroot_prefix/share/vulkan/icd.d/lvp_icd.$(uname -m).json" && -z "${VK_DRIVER_FILES:-}" ]]; then
+        export VK_DRIVER_FILES="$aura_sysroot_prefix/share/vulkan/icd.d/lvp_icd.$(uname -m).json"
+    fi
+    if [[ -d "$aura_sysroot_prefix/lib/$aura_triplet/dri" && -z "${LIBGL_DRIVERS_PATH:-}" ]]; then
+        export LIBGL_DRIVERS_PATH="$aura_sysroot_prefix/lib/$aura_triplet/dri"
+    fi
+    if [[ -f "$aura_sysroot_prefix/share/glvnd/egl_vendor.d/50_mesa.json" && -z "${__EGL_VENDOR_LIBRARY_FILENAMES:-}" ]]; then
+        export __EGL_VENDOR_LIBRARY_FILENAMES="$aura_sysroot_prefix/share/glvnd/egl_vendor.d/50_mesa.json"
+    fi
+    unset aura_sysroot_prefix aura_triplet
+fi

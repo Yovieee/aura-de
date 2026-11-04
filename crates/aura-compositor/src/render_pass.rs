@@ -1,8 +1,8 @@
 //! Coordinates the Dual-Kawase blur pyramid and Liquid Glass uniform blocks per output frame.
 
-use aura_core::{LiquidGlassMaterial, Rect};
-use aura_render::{plan_dual_kawase_pyramid, KawaseMipLevel, LiquidGlassUniforms};
 use crate::state::AuraCompositorState;
+use aura_core::{LiquidGlassMaterial, Rect};
+use aura_render::{KawaseMipLevel, LiquidGlassUniforms, plan_dual_kawase_pyramid};
 
 #[derive(Debug, Clone)]
 pub struct FrameRenderPlan {

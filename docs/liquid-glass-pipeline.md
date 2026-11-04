@@ -1,5 +1,7 @@
 # Liquid Glass Shader & Optical Pipeline Guide
 
+The optical layers below are design targets. Shader parsing/validation, successful GPU render/read-back and live compositor backdrop integration are separate checks; consult [implementation status](implementation-status.md) for observed results. A shell client has no automatic access to other Wayland clients' pixels. Backdrop capture and the client/compositor contract must be implemented in the compositor before live transparency can be claimed.
+
 ## Physical Inspiration & Optical Layers
 
 Aura DE's **Liquid Glass** aesthetic models each translucent shell surface (Top Menu Bar, Floating Dock, Control Center, Notification Toast, and Window Titlebar) as a curved dielectric slab with index of refraction $n_{\text{glass}} \in [1.33, 1.65]$ (default $1.48$, matching crown/acrylic optical glass).

@@ -17,7 +17,11 @@ pub enum TitlebarHit {
     ClientContent(WindowId),
 }
 
-pub fn classify_three_finger_swipe(dx: f32, dy: f32, threshold: f32) -> Option<TouchpadSwipeGesture> {
+pub fn classify_three_finger_swipe(
+    dx: f32,
+    dy: f32,
+    threshold: f32,
+) -> Option<TouchpadSwipeGesture> {
     if dx.hypot(dy) < threshold {
         return None;
     }
@@ -84,7 +88,10 @@ pub fn hit_test_window_chrome(
             return Some(TitlebarHit::EdgeSnapPreview(window_id, SnapZone::RightHalf));
         }
         if cursor_y <= output_rect.y + 32.0 + edge_margin {
-            return Some(TitlebarHit::EdgeSnapPreview(window_id, SnapZone::MaximizeFill));
+            return Some(TitlebarHit::EdgeSnapPreview(
+                window_id,
+                SnapZone::MaximizeFill,
+            ));
         }
 
         return Some(TitlebarHit::TitlebarDrag(window_id));

@@ -35,35 +35,82 @@ pub struct Spring1D {
 impl Spring1D {
     pub fn new(initial: f32, config: SpringConfig) -> Self {
         Self {
-            value: initial,
+            value: if initial.is_finite() { initial } else { 0.0 },
             velocity: 0.0,
-            target: initial,
+            target: if initial.is_finite() { initial } else { 0.0 },
             config,
         }
     }
 
     pub fn set_target(&mut self, target: f32) {
-        self.target = target;
+        if target.is_finite() {
+            self.target = target;
+        }
     }
 
-    /// Advance the spring state by `dt` seconds using semi-implicit Euler integration
-    /// sub-stepped for unconditional stability across variable refresh rates (60Hz–240Hz).
+    /// Advance the exact damped oscillator solution. Unlike Euler integration,
+    /// this remains stable after long frame stalls and does not depend on refresh rate.
+    /// Invalid elapsed times/configuration do not advance the animation.
     pub fn step(&mut self, dt: f32) -> f32 {
-        if dt <= 0.0 {
+        if !self.value.is_finite() {
+            self.value = if self.target.is_finite() {
+                self.target
+            } else {
+                0.0
+            };
+        }
+        if !self.target.is_finite() {
+            self.target = self.value;
+        }
+        if !self.velocity.is_finite() {
+            self.velocity = 0.0;
+        }
+        if !dt.is_finite()
+            || dt <= 0.0
+            || !self.config.angular_frequency.is_finite()
+            || self.config.angular_frequency <= 0.0
+            || !self.config.damping_ratio.is_finite()
+            || self.config.damping_ratio < 0.0
+        {
             return self.value;
         }
-        let substeps = ((dt / (1.0 / 240.0)).ceil() as usize).clamp(1, 16);
-        let h = dt / (substeps as f32);
-        let omega = self.config.angular_frequency;
-        let zeta = self.config.damping_ratio;
-
-        for _ in 0..substeps {
-            let displacement = self.value - self.target;
-            let accel = -omega * omega * displacement - 2.0 * zeta * omega * self.velocity;
-            self.velocity += accel * h;
-            self.value += self.velocity * h;
-        }
-
+        // Use f64 intermediates so finite f32 inputs cannot overflow the solution.
+        let t = f64::from(dt);
+        let omega = f64::from(self.config.angular_frequency);
+        let zeta = f64::from(self.config.damping_ratio);
+        let x = f64::from(self.value) - f64::from(self.target);
+        let velocity = f64::from(self.velocity);
+        let (displacement, next_velocity) = if (zeta - 1.0).abs() < 1e-6 {
+            let decay = (-omega * t).exp();
+            let coefficient = velocity + omega * x;
+            (
+                (x + coefficient * t) * decay,
+                (velocity - omega * coefficient * t) * decay,
+            )
+        } else if zeta < 1.0 {
+            let damped = omega * (1.0 - zeta * zeta).sqrt();
+            let (sin, cos) = (damped * t).sin_cos();
+            let decay = (-zeta * omega * t).exp();
+            (
+                decay * (x * cos + (velocity + zeta * omega * x) / damped * sin),
+                decay
+                    * (velocity * cos
+                        - (zeta * omega * velocity + omega * omega * x) / damped * sin),
+            )
+        } else {
+            let root = (zeta * zeta - 1.0).sqrt();
+            let fast = -omega * (zeta + root);
+            // Equivalent to -omega*(zeta-root), without catastrophic cancellation.
+            let slow = -omega / (zeta + root);
+            let a = (velocity - fast * x) / (slow - fast);
+            let b = x - a;
+            let a_decay = a * (slow * t).exp();
+            let b_decay = b * (fast * t).exp();
+            (a_decay + b_decay, slow * a_decay + fast * b_decay)
+        };
+        self.value = (f64::from(self.target) + displacement)
+            .clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32;
+        self.velocity = next_velocity.clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32;
         if (self.value - self.target).abs() < 0.01 && self.velocity.abs() < 0.05 {
             self.value = self.target;
             self.velocity = 0.0;
@@ -134,5 +181,67 @@ mod tests {
         assert!(s.is_settled());
         assert_eq!(s.value, 100.0);
         assert!(max_seen <= 100.05, "unexpected overshoot: {max_seen}");
+    }
+
+    #[test]
+    fn long_frame_stalls_remain_finite_and_converge() {
+        for config in [
+            SpringConfig::CRITICALLY_DAMPED,
+            SpringConfig::FLUID_BOUNCE,
+            SpringConfig {
+                angular_frequency: 24.0,
+                damping_ratio: 2.0,
+            },
+        ] {
+            let mut spring = Spring1D::new(0.0, config);
+            spring.set_target(100.0);
+            let value = spring.step(1.0);
+            assert!(
+                value.is_finite() && (value - 100.0).abs() < 1.0,
+                "{config:?}: {spring:?}"
+            );
+            spring.step(100.0);
+            assert!(spring.is_settled());
+            assert_eq!(spring.value, 100.0);
+        }
+    }
+
+    #[test]
+    fn analytic_solution_is_independent_of_frame_rate() {
+        for config in [
+            SpringConfig::CRITICALLY_DAMPED,
+            SpringConfig::FLUID_BOUNCE,
+            SpringConfig {
+                angular_frequency: 24.0,
+                damping_ratio: 2.0,
+            },
+        ] {
+            let mut one_step = Spring1D::new(-100.0, config);
+            one_step.set_target(100.0);
+            let mut small_steps = one_step;
+            one_step.step(0.2);
+            for _ in 0..24 {
+                small_steps.step(1.0 / 120.0);
+            }
+            assert!((one_step.value - small_steps.value).abs() < 0.001);
+            assert!((one_step.velocity - small_steps.velocity).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn invalid_time_target_and_configuration_do_not_poison_spring() {
+        let mut spring = Spring1D::new(42.0, SpringConfig::CRITICALLY_DAMPED);
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            spring.set_target(invalid);
+            assert_eq!(spring.target, 42.0);
+            assert_eq!(spring.step(invalid), 42.0);
+        }
+        spring.config.angular_frequency = f32::NAN;
+        assert_eq!(spring.step(0.1), 42.0);
+        spring.value = f32::NAN;
+        spring.target = f32::INFINITY;
+        spring.velocity = f32::NAN;
+        assert!(spring.step(0.1).is_finite());
+        assert!(spring.velocity.is_finite() && spring.target.is_finite());
     }
 }

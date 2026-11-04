@@ -10,8 +10,18 @@
 
 | Task | Command | Notes |
 | :--- | :--- | :--- |
-| **Workspace & Math Audit** | `python3 scripts/verify_workspace.py` | Verifies all 6 TOML manifests, module paths, shader uniforms, and optical math (Verified) |
-| **Unit Tests** | `cargo test --workspace` | Runs unit tests in `aura-core`, `aura-render`, `aura-launcher`, and `aura-session` (Unverified on sandbox; run on Linux host) |
-| **Type & Borrow Check** | `cargo check --workspace --all-targets` | Validates all 6 crates including Smithay/SCTK bindings |
-| **Linting** | `cargo clippy --workspace --all-targets -- -D warnings` | Enforce zero warnings before committing |
-| **Nested Compositor Smoke Run** | `cargo run -p aura-compositor -- --backend winit --smoke-test` | Initializes state, compiles shaders, tests gesture hit-testing, and exits cleanly |
+| **Workspace Structure** | `python3 scripts/verify_workspace.py` | Manifest, dependency-boundary and source-path checks only; does not prove runtime behavior |
+| **Core Unit Tests** | `cargo test -p aura-core --locked` | Must build independently without GPU, Wayland socket or feature overrides |
+| **Workspace Tests** | `cargo test --workspace --locked` | Rust implementation tests; retain per-suite counts and distinguish skips |
+| **Type & Borrow Check** | `cargo check --workspace --all-targets --locked` | Check all crates and examples |
+| **Formatting** | `cargo fmt --all -- --check` | Check without rewriting unrelated files |
+| **Linting** | `cargo clippy --workspace --all-targets --locked -- -D warnings` | Zero warnings before committing |
+| **Nested Integration Smoke** | `python3 scripts/smoke_nested.py --software` | Real SHM client configure/frame callback test; uses Xvfb if needed |
+
+## 3. Development and Evidence
+
+Use the existing checkout. Cloud tasks are already isolated; do not create a Git worktree unless explicitly requested. Preserve user changes. The Rust toolchain is pinned by `rust-toolchain.toml`; keep `Cargo.lock` tracked and use `--locked` for repeatable builds.
+
+Install Debian/Ubuntu host dependencies through `scripts/install-deps.sh`. Add `--native` only for optional native-backend dependencies and `--testing` for software-rendered integration checks. A cloud user-local sysroot can be selected through `AURA_SYSROOT` and `scripts/dev-env.sh`.
+
+Keep [implementation status](docs/implementation-status.md) honest: unit tests, shader validation, GPU rendering, real Wayland client integration and hardware session tests provide different evidence. Never infer a working service from a log message, fake resource ID, open port, or a zero-exit demonstration. Fail explicitly when a requested backend or capability is unsupported.

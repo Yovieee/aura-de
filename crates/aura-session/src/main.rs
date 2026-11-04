@@ -1,39 +1,20 @@
-//! `aura-session`: Slice 6 — `libseat` session coordinator, fullscreen direct-scanout bypass,
-//! and `org.freedesktop.impl.portal.ScreenCast` PipeWire portal interface.
+//! Session entry point. A compositor, its shell, and their cleanup have one owner.
 
-use aura_core::{WindowNode, WindowStateFlags};
-use tracing::info;
-use zbus::interface;
+mod portal;
+mod scanout;
+mod supervisor;
 
-pub fn can_direct_scanout(top_window: &WindowNode, format_modifier_supported: bool) -> bool {
-    top_window.flags.contains(WindowStateFlags::FULLSCREEN)
-        && top_window.flags.contains(WindowStateFlags::FOCUSED)
-        && !top_window.flags.contains(WindowStateFlags::MINIMIZED)
-        && format_modifier_supported
-}
+use std::os::unix::process::CommandExt;
+use supervisor::{Options, ParseResult};
 
-#[derive(Debug, Default)]
-pub struct AuraScreenCastPortal {
-    pub active_streams: u32,
-}
-
-#[interface(name = "org.freedesktop.impl.portal.ScreenCast")]
-impl AuraScreenCastPortal {
-    async fn start_screencast(&mut self, output_name: &str, cursor_embedded: bool) -> u32 {
-        self.active_streams += 1;
-        let node_id = 1000 + self.active_streams;
-        info!(
-            output_name,
-            cursor_embedded,
-            pipewire_node_id = node_id,
-            "Started PipeWire DMA-BUF screencast stream"
-        );
-        node_id
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let options = match Options::parse(std::env::args().skip(1))? {
+        ParseResult::Help => {
+            println!("{}", supervisor::HELP);
+            return Ok(());
+        }
+        ParseResult::Run(options) => options,
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -41,28 +22,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let mut portal = AuraScreenCastPortal::default();
-    let stream_id = portal.start_screencast("eDP-1", true).await;
-    info!(stream_id, "Aura Session & xdg-desktop-portal daemon ready");
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use aura_core::Rect;
-
-    #[test]
-    fn fullscreen_focused_window_enables_direct_scanout_bypass() {
-        let win = WindowNode {
-            id: 1,
-            app_id: "org.aura.Game".into(),
-            title: "Vulkan App".into(),
-            floating_rect: Rect::new(0.0, 0.0, 1920.0, 1080.0),
-            computed_rect: Rect::new(0.0, 0.0, 1920.0, 1080.0),
-            flags: WindowStateFlags::FOCUSED | WindowStateFlags::FULLSCREEN,
-        };
-        assert!(can_direct_scanout(&win, true));
-        assert!(!can_direct_scanout(&win, false));
+    // Replace this process before starting Tokio threads; do not set global
+    // environment variables from a runtime worker.
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+        let error = std::process::Command::new("dbus-run-session")
+            .arg("--")
+            .arg(std::env::current_exe()?)
+            .args(std::env::args_os().skip(1))
+            .exec();
+        return Err(format!("could not start session D-Bus with dbus-run-session: {error}").into());
     }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        if options.portal_only {
+            let _service = portal::serve().await?;
+            tracing::info!("Aura portal backend exported; screen capture is not supported yet");
+            supervisor::shutdown_signal().await?;
+            Ok::<(), Box<dyn std::error::Error>>(())
+        } else {
+            supervisor::run(options).await?;
+            Ok(())
+        }
+    })
 }

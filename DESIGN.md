@@ -1,5 +1,7 @@
 # Aura DE — Comprehensive Architecture & Liquid Glass Design Plan
 
+This document specifies design targets. Its equations, protocol lists and visual descriptions are not evidence of a working implementation. See [implementation and verification status](docs/implementation-status.md) for runtime evidence and unfinished platform work.
+
 ## 1. Executive Summary & Architectural Vision
 
 **Aura Desktop Environment (`aura-de`)** is a next-generation Linux desktop environment engineered from scratch in Rust around Wayland. It unites macOS spatial desktop ergonomics—a persistent 32px Top Menu Bar, a parabolic-magnification Floating Dock, traffic-light window controls, Stage Manager side-strips, and interruptible spring animations—with a physical GPU shader pipeline called **Liquid Glass**.
@@ -12,7 +14,7 @@ To keep core window layout logic 100% deterministic and testable without a GPU o
 
 | Crate | Layer Role | Primary Rust Dependencies | I/O & Hardware Boundary |
 | :--- | :--- | :--- | :--- |
-| `crates/aura-core` | Pure spatial layout (`Floating`, `StageManager`, `DynamicTiling`), critically damped spring solver, parabolic Dock magnification, and `LiquidGlassMaterial` math | `glam`, `serde`, `thiserror`, `bitflags` | **Zero I/O** (Pure CPU math; unit tests run in `<10ms` headless) |
+| `crates/aura-core` | Pure spatial layout (`Floating`, `StageManager`, `DynamicTiling`), critically damped spring solver, parabolic Dock magnification, and `LiquidGlassMaterial` math | `glam`, `serde`, `thiserror`, `bitflags` | **Zero I/O** (headless CPU-only implementation tests) |
 | `crates/aura-render` | 64-byte `std140` uniform packers, Dual-Kawase FBO mip planner, and dual-target shaders (`liquid_glass.wgsl` + `liquid_glass.frag`) | `wgpu`, `bytemuck`, `glam`, `aura-core` | GPU shader compilation & uniform buffer alignment |
 | `crates/aura-compositor` | Wayland display server (`xdg-shell`, `wlr-layer-shell`, `ext-background-effect-v1`), damage-tracked backdrop pyramid, input routing | `smithay`, `calloop`, `wayland-server`, `aura-core`, `aura-render` | Wayland sockets, DRM/KMS, GBM, EGL, `libinput`, `libseat` |
 | `crates/aura-shell` | Client-side layer-shell Menu Bar (`32px` exclusive zone), Floating Liquid Glass Dock, and `org.aura.Shell1` D-Bus service | `smithay-client-toolkit`, `wgpu`, `zbus`, `tokio` | Wayland client socket (`wlr-layer-shell`), D-Bus session bus |
@@ -45,15 +47,15 @@ To keep core window layout logic 100% deterministic and testable without a GPU o
 * **Floating Mode (Default macOS Ergonomics)**: Windows spawn cascaded around the workspace center with server-negotiated Liquid Glass titlebars (`xdg-decoration-unstable-v1`), top-left Traffic Light buttons (`Close` in `#FF5F56`, `MinimizeToDock` in `#FFBD2E`, `ToggleZoomFullscreen` in `#27C93F`), and Sequoia-style edge-drag smart snap zones.
 * **Stage Manager Mode**: Keeps the focused window centered on the main stage while docking background windows into a `196px`-wide left-hand vertical strip of live Liquid Glass thumbnails (`132px` height each).
 * **Dynamic Tiling Mode**: Automatically arranges windows into a 55% master / 45% vertical stack split for keyboard-centric engineering workflows.
-* **240Hz Critically Damped Springs & Parabolic Dock Magnification**: Sub-stepped second-order ODE springs ($\omega_0 = 24.0\text{ rad/s}, \zeta = 1.0$) and a raised-cosine Dock icon magnifier (`52px` to `84px` peak).
+* **Critically Damped Springs & Parabolic Dock Magnification**: Interruptible second-order springs ($\omega_0 = 24.0\text{ rad/s}, \zeta = 1.0$) must handle variable frame time and suspend/resume without diverging. A raised-cosine Dock icon magnifier targets `52px` to `84px` peak.
 
 ## 5. Stepwise Implementation Roadmap & Verification Matrix
 
 | Milestone | Scope & Deliverables | Verification Criteria (Definition of Done) | Current Status |
 | :--- | :--- | :--- | :--- |
-| **Milestone 1: Core Math & Layout Skeleton** | `Cargo.toml`, `aura-core` (`layout.rs`, `material.rs`, `spring.rs`, `dock.rs`) | Deterministic unit tests (`cargo test -p aura-core`) + `verify_workspace.py` mathematical invariant checks | **Completed & Verified** |
-| **Milestone 2: Liquid Glass Shader Engine** | `aura-render` (`LiquidGlassUniforms`, Dual-Kawase planner, `.wgsl` & `.frag` shaders) | 64-byte `std140` alignment check, Dual-Kawase mip halving tests, shader path validation | **Completed & Verified** |
-| **Milestone 3: Nested Compositor & Shell** | `aura-compositor` (`state.rs`, `render_pass.rs`, `main.rs`) & `aura-shell` (`main.rs`, `ipc.rs`) | `--backend winit --smoke-test` initializes state, maps test windows, and builds `FrameRenderPlan` | **Completed & Verified** |
-| **Milestone 4: Interactive Input & Gestures** | `crates/aura-compositor/src/input.rs` (`libinput` 3-finger swipe & Traffic Light hit-testing) | Gesture classification & 40px titlebar hit-testing verified | **Completed & Verified** |
-| **Milestone 5: Spotlight Launcher** | `crates/aura-launcher` (`wlr-layer-shell` overlay with fuzzy app search) | Prefix/keyword ranking & uniform packer verified | **Completed & Verified** |
-| **Milestone 6: Bare-Metal DRM/KMS & Portals** | `crates/aura-session` (direct scanout bypass & `xdg-desktop-portal` PipeWire screencast) | Fullscreen scanout bypass & D-Bus portal interface verified | **Completed & Verified** |
+| **Milestone 1: Core Math & Layout** | Pure layout/focus, material validation, spring solver and Dock geometry | Locked core tests including minimize/restore, stall and invalid-parameter regression cases | See current evidence in implementation status |
+| **Milestone 2: Liquid Glass GPU Engine** | Uniforms, shaders, textures and executable render passes | Shader validation, GPU read-back/visual checks, resize and fallback behavior | See current evidence in implementation status |
+| **Milestone 3: Nested Compositor & Shell** | Persistent Wayland server, client lifecycle, input and layer-shell panels | Real SHM client configure/commit/frame callbacks; visible shell surfaces and interaction | See current evidence in implementation status |
+| **Milestone 4: Input & Gestures** | Pointer/keyboard focus, move/resize, chrome actions and libinput gesture lifecycle | Real input events, gesture cancel behavior and client focus restoration | Native gesture validation outstanding |
+| **Milestone 5: Launcher & IPC** | XDG desktop entries, application execution, overlay and D-Bus services | Installed application launch, keyboard navigation and service integration | See current evidence in implementation status |
+| **Milestone 6: Native Session & Portals** | DRM/KMS session, supervision, PipeWire ScreenCast and conservative scanout | Named-hardware session tests and real captured frames, including cancellation/cleanup | Native hardware and real capture gates outstanding |
