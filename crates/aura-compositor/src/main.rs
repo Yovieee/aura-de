@@ -1,100 +1,79 @@
-//! `aura-compositor`: Entry point for the Aura Wayland compositor.
+//! Aura's nested Wayland server. Native hardware backends remain explicitly unsupported.
+mod glass;
+mod runtime;
 
-mod input;
-mod render_pass;
-mod state;
+use aura_core::GlassQualityPreset;
+use std::{env, error::Error};
 
-use aura_core::{GlassQualityPreset, LayoutMode, TrafficLightAction};
-use aura_render::{
-    DUAL_KAWASE_DOWN_GLES_SOURCE, DUAL_KAWASE_UP_GLES_SOURCE, LIQUID_GLASS_GLES_SOURCE,
-};
-use input::{classify_three_finger_swipe, hit_test_window_chrome};
-use render_pass::build_frame_render_plan;
-use state::AuraCompositorState;
-use tracing::info;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackendKind {
-    WinitNested,
-    TtyUdev,
+#[derive(Debug)]
+pub(crate) struct Config {
+    pub socket: String,
+    pub size: (i32, i32),
+    pub scale: i32,
+    pub quality: GlassQualityPreset,
+    pub smoke: bool,
 }
 
-fn parse_args() -> (BackendKind, bool) {
-    let mut backend = BackendKind::WinitNested;
-    let mut smoke_test = false;
-    let mut args = std::env::args().skip(1);
-
+fn config() -> Result<Config, Box<dyn Error>> {
+    let mut backend = env::var("AURA_BACKEND").unwrap_or_else(|_| "winit".into());
+    let mut config = Config {
+        socket: env::var("AURA_WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-aura-0".into()),
+        size: (1280, 800),
+        scale: env::var("AURA_OUTPUT_SCALE")
+            .unwrap_or_else(|_| "1".into())
+            .parse()?,
+        quality: match env::var("AURA_GLASS_QUALITY")
+            .as_deref()
+            .unwrap_or("balanced")
+        {
+            "ultra" => GlassQualityPreset::Ultra,
+            "balanced" => GlassQualityPreset::Balanced,
+            "reduced-transparency" => GlassQualityPreset::ReducedTransparency,
+            other => return Err(format!("invalid AURA_GLASS_QUALITY: {other}").into()),
+        },
+        smoke: false,
+    };
+    if let Ok(size) = env::var("AURA_WINIT_RESOLUTION") {
+        let (width, height) = size
+            .split_once('x')
+            .ok_or("resolution must be WIDTHxHEIGHT")?;
+        config.size = (width.parse()?, height.parse()?);
+    }
+    let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--backend" => {
-                if let Some(val) = args.next() {
-                    if val == "tty-udev" || val == "drm" {
-                        backend = BackendKind::TtyUdev;
-                    }
-                }
+            "--backend" => backend = args.next().ok_or("--backend requires a value")?,
+            "--socket" => config.socket = args.next().ok_or("--socket requires a value")?,
+            "--smoke-test" => config.smoke = true,
+            "--help" | "-h" => {
+                println!(
+                    "aura-compositor [--backend winit] [--socket NAME] [--smoke-test]\nConfigure with AURA_WINIT_RESOLUTION, AURA_OUTPUT_SCALE (integer), AURA_GLASS_QUALITY.\nRun inside an existing X11/Wayland desktop. Native DRM/KMS is not implemented."
+                );
+                std::process::exit(0);
             }
-            "--smoke-test" => smoke_test = true,
-            _ => {}
+            other => return Err(format!("unknown argument: {other}").into()),
         }
     }
-    (backend, smoke_test)
+    if backend != "winit" {
+        return Err(format!("backend {backend:?} is not implemented; use winit").into());
+    }
+    if config.size.0 < 64 || config.size.1 < 64 || config.size.0 > 8192 || config.size.1 > 8192 {
+        return Err("resolution must be between 64 and 8192 pixels per axis".into());
+    }
+    if !(1..=4).contains(&config.scale) {
+        return Err("AURA_OUTPUT_SCALE must be an integer from 1 to 4".into());
+    }
+    if config.socket.is_empty() || config.socket.contains('/') {
+        return Err("--socket must be a filename within XDG_RUNTIME_DIR".into());
+    }
+    Ok(config)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-
-    let (backend, smoke_test) = parse_args();
-    let mut state = AuraCompositorState::new(1920.0, 1080.0, GlassQualityPreset::Ultra);
-    state
-        .glass_material
-        .validate(state.workspace.menu_bar_height)?;
-
-    info!(
-        ?backend,
-        socket = %state.socket_name,
-        gles_shader_bytes = LIQUID_GLASS_GLES_SOURCE.len(),
-        kawase_down_bytes = DUAL_KAWASE_DOWN_GLES_SOURCE.len(),
-        kawase_up_bytes = DUAL_KAWASE_UP_GLES_SOURCE.len(),
-        "Initialized Aura Wayland Compositor with Liquid Glass optical pipeline"
-    );
-
-    state.map_xdg_window(1, "org.aura.Terminal", "Aura Terminal", (860.0, 540.0));
-    state.map_xdg_window(2, "org.aura.Files", "Aura Files", (920.0, 600.0));
-    state.set_layout_mode(LayoutMode::StageManager);
-    state.tick_frame(1.0 / 120.0);
-
-    let plan = build_frame_render_plan(&state);
-    info!(
-        frame = plan.frame_number,
-        kawase_passes = plan.kawase_mips.len(),
-        blurred_surfaces = plan.surface_uniforms.len(),
-        "Compiled initial FrameRenderPlan for Smithay GlesRenderer"
-    );
-
-    if smoke_test {
-        let gesture = classify_three_finger_swipe(0.0, -48.0, 24.0);
-        let hit = hit_test_window_chrome(
-            1,
-            state.workspace.windows()[0].computed_rect,
-            400.0,
-            200.0,
-            state.workspace.output_rect,
-        );
-        info!(
-            ?gesture,
-            ?hit,
-            "Verified Slice 4 input gesture classification and titlebar hit-testing"
-        );
-        state.handle_traffic_light(2, TrafficLightAction::MinimizeToDock);
-        info!("Smoke test completed cleanly; exiting.");
-        return Ok(());
-    }
-
-    info!("Ready to accept Wayland clients on {}", state.socket_name);
-    Ok(())
+    runtime::run(config()?)
 }

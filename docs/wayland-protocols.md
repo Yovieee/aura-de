@@ -1,11 +1,20 @@
 # Wayland Protocols & Session Lifecycle
 
-Aura Compositor (`aura-compositor`) implements the following core and staging Wayland protocols:
+The nested compositor must publish and exercise protocol globals through a real Wayland client. Treat the following list as the protocol contract and roadmap; exact implemented/tested coverage is tracked in [implementation status](implementation-status.md), rather than inferred from dependency names.
 
-| Protocol | Purpose in Aura DE |
+| Protocol | Purpose and current coverage |
 | :--- | :--- |
-| `wl_compositor` / `wl_shm` / `linux-dmabuf-v1` | Zero-copy DMA-BUF texture sharing and shared-memory fallback buffers |
+| `wl_compositor` / `wl_shm` | Base surface lifecycle and shared-memory buffers; required by the integration smoke client |
+| `linux-dmabuf-v1` | Planned hardware-buffer import; not currently advertised by the nested server |
 | `xdg-shell` (`xdg_wm_base`) | Standard application window lifecycle, popups, and resize/move interactive grabs |
-| `xdg-decoration-unstable-v1` | Negotiates client-side vs. server-side Liquid Glass titlebar decorations with macOS traffic-light buttons |
-| `wlr-layer-shell-unstable-v1` | Anchors `aura-shell` surfaces (Background wallpaper, Top Menu Bar with `32px` exclusive zone, Floating Dock, and Overlay Lock Screen) |
-| `ext-background-effect-v1` | Standard Wayland staging protocol allowing clients to declare region masks that receive compositor-rendered Dual-Kawase Liquid Glass blur |
+| `xdg-decoration-unstable-v1` | Planned server-side decoration negotiation; clients currently provide their own decorations |
+| `wlr-layer-shell-unstable-v1` | Anchors shell panel/Dock and launcher overlay, with output bounds and exclusive-zone handling |
+| `ext-background-effect-v1` | Planned standard region-mask negotiation; current glass is compositor-owned for Aura shell namespaces only |
+
+## Session lifecycle
+
+`aura-session` supervises a nested compositor and its shell. It preserves the host display environment for winit, waits for the nested Wayland socket, and passes that socket only to client processes. If no session bus exists, `dbus-run-session` creates one. SIGINT/SIGTERM or child failure stops and reaps owned child process groups. See `aura-session --help` for binary overrides and startup timeout.
+
+Run the nested session inside an existing X11/Wayland session. A native DRM/KMS backend, logind/libseat pause/resume and VT switching require separate implementation and hardware evidence. Do not install the nested preview as a machine's default bare-metal login session.
+
+The portal backend exports explicit capabilities and standard method signatures. Until a compositor/PipeWire capture transport exists, ScreenCast operations return `NotSupported`; fabricated node IDs are never a substitute for a stream. Activation descriptors do not enable recording. Lock-screen support is a separate security/protocol task and is not provided by a layer-shell overlay.

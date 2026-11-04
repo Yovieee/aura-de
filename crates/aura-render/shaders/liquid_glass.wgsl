@@ -53,10 +53,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dist = squircle_sdf(local_p, half_extents, radius);
 
     let edge_alpha = 1.0 - smoothstep(-0.75, 0.75, dist);
-    if (edge_alpha <= 0.001) {
-        let shadow_alpha = 0.28 * exp(-max(dist, 0.0) / max(u_glass.bevel_and_specular.w, 8.0));
-        return vec4<f32>(0.0, 0.0, 0.0, shadow_alpha);
-    }
+    // Composite the shadow behind the panel continuously across the edge.
+    // RGB is premultiplied below; this matches PREMULTIPLIED_ALPHA_BLENDING.
+    let shadow_alpha = 0.28 * exp(-max(dist, 0.0) / max(u_glass.bevel_and_specular.w, 8.0));
+    let final_alpha = edge_alpha + shadow_alpha * (1.0 - edge_alpha);
 
     let bevel_t = clamp((dist + bevel_width) / bevel_width, 0.0, 1.0);
     let theta = bevel_t * 1.287;
@@ -92,7 +92,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let spec_lobe = pow(max(dot(normal, half_vec), 0.0), 28.0);
     let rim_highlight = (fresnel * 0.55 + spec_lobe * 0.85) * u_glass.bevel_and_specular.z;
 
-    let tinted = mix(backdrop_rgb, u_glass.tint_rgba.rgb, u_glass.tint_rgba.a);
-    let final_rgb = clamp(tinted + vec3<f32>(rim_highlight), vec3<f32>(0.0), vec3<f32>(1.0));
-    return vec4<f32>(final_rgb, edge_alpha);
+    // An opaque accessibility fallback must not depend on backdrop contents.
+    let reduced_transparency = ior == 1.0 && dispersion == 0.0;
+    let tinted = select(mix(backdrop_rgb, u_glass.tint_rgba.rgb, u_glass.tint_rgba.a), u_glass.tint_rgba.rgb, reduced_transparency);
+    let final_rgb = max(tinted + vec3<f32>(rim_highlight), vec3<f32>(0.0));
+    return vec4<f32>(final_rgb * edge_alpha, final_alpha);
 }

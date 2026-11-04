@@ -1,0 +1,58 @@
+name: Rust and nested Wayland
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 4
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install host dependencies
+        run: sudo bash scripts/install-deps.sh --native --testing
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Check repository structure
+        run: python3 scripts/verify_workspace.py
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check all targets and optional backends
+        run: cargo check --workspace --all-targets --all-features --locked
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run Rust tests
+        run: cargo test --workspace --locked
+      - name: Nested Wayland integration smoke
+        run: python3 scripts/smoke_nested.py --software
+      - name: Desktop lifecycle integration
+        run: python3 scripts/integration_desktop.py --software
+      - name: Session and real input integration
+        run: python3 scripts/session_smoke.py --no-build
+      - name: GPU pixel readback and GLES driver compilation
+        run: |
+          cargo test -p aura-render --test gpu --locked -- --ignored --nocapture
+          cargo test -p aura-render --test gles --locked -- --ignored --nocapture
+      - name: Private D-Bus services
+        run: |
+          dbus-run-session -- cargo test -p aura-session portal_dbus_lifecycle --locked -- --ignored
+          dbus-run-session -- cargo run -p aura-shell --example dbus_smoke --locked
+      - name: Save smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nested-smoke-logs
+          path: |
+            target/smoke-logs/
+            target/desktop-smoke-logs/
+            target/session-smoke-logs/
+          if-no-files-found: ignore

@@ -6,6 +6,18 @@ use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum LiquidGlassError {
+    #[error("panel dimension ({0}) must be finite and positive")]
+    InvalidPanelDimension(f32),
+    #[error(
+        "chromatic dispersion ({0}) must be finite, non-negative, and keep every channel index within [1, 2.5]"
+    )]
+    InvalidChromaticDispersion(f32),
+    #[error("Kawase offset ({0}) must be finite and positive")]
+    InvalidKawaseOffset(f32),
+    #[error("specular intensity ({0}) must be finite and non-negative")]
+    InvalidSpecularIntensity(f32),
+    #[error("tint component {index} ({value}) must be finite and within [0, 1]")]
+    InvalidTintComponent { index: usize, value: f32 },
     #[error("index of refraction ({0}) must lie within physical dielectric range [1.0, 2.5]")]
     InvalidIndexOfRefraction(f32),
     #[error("corner radius ({0}) must be non-negative")]
@@ -96,20 +108,45 @@ impl LiquidGlassMaterial {
 
     /// Validate physical and geometric invariants before uploading uniforms to the GPU.
     pub fn validate(&self, min_panel_dimension: f32) -> Result<(), LiquidGlassError> {
-        if !(1.0..=2.5).contains(&self.ior) || self.ior.is_nan() {
+        if !min_panel_dimension.is_finite() || min_panel_dimension <= 0.0 {
+            return Err(LiquidGlassError::InvalidPanelDimension(min_panel_dimension));
+        }
+        if !(1.0..=2.5).contains(&self.ior) {
             return Err(LiquidGlassError::InvalidIndexOfRefraction(self.ior));
         }
-        if self.corner_radius < 0.0 || self.corner_radius.is_nan() {
+        if !self.chromatic_dispersion.is_finite()
+            || self.chromatic_dispersion < 0.0
+            || self.ior - self.chromatic_dispersion < 1.0
+            || self.ior + self.chromatic_dispersion > 2.5
+        {
+            return Err(LiquidGlassError::InvalidChromaticDispersion(
+                self.chromatic_dispersion,
+            ));
+        }
+        if self.corner_radius < 0.0 || !self.corner_radius.is_finite() {
             return Err(LiquidGlassError::InvalidCornerRadius(self.corner_radius));
         }
         if self.bevel_width <= 0.0
             || self.bevel_width > min_panel_dimension * 0.5
-            || self.bevel_width.is_nan()
+            || !self.bevel_width.is_finite()
         {
             return Err(LiquidGlassError::InvalidBevelWidth(self.bevel_width));
         }
         if self.kawase_blur_passes > 6 {
             return Err(LiquidGlassError::InvalidBlurPasses(self.kawase_blur_passes));
+        }
+        if !self.kawase_offset.is_finite() || self.kawase_offset <= 0.0 {
+            return Err(LiquidGlassError::InvalidKawaseOffset(self.kawase_offset));
+        }
+        if !self.specular_intensity.is_finite() || self.specular_intensity < 0.0 {
+            return Err(LiquidGlassError::InvalidSpecularIntensity(
+                self.specular_intensity,
+            ));
+        }
+        for (index, &value) in self.tint_rgba.iter().enumerate() {
+            if !(0.0..=1.0).contains(&value) {
+                return Err(LiquidGlassError::InvalidTintComponent { index, value });
+            }
         }
         Ok(())
     }
@@ -187,6 +224,101 @@ mod tests {
         let half = Vec2::new(200.0, 40.0);
         assert_eq!(mat.refract_uv_offset(Vec2::ZERO, half), Vec2::ZERO);
         let offset = mat.refract_uv_offset(Vec2::new(194.0, 0.0), half);
-        assert!(offset.x < 0.0, "expected inward refraction along +X rim, got {offset:?}");
+        assert!(
+            offset.x < 0.0,
+            "expected inward refraction along +X rim, got {offset:?}"
+        );
+    }
+
+    #[test]
+    fn all_quality_presets_are_valid_and_refraction_denominators_are_physical() {
+        for preset in [
+            GlassQualityPreset::Ultra,
+            GlassQualityPreset::Balanced,
+            GlassQualityPreset::ReducedTransparency,
+        ] {
+            let material = LiquidGlassMaterial::from_preset(preset);
+            assert!(material.validate(64.0).is_ok());
+            assert!(material.ior - material.chromatic_dispersion >= 1.0);
+        }
+        let material = LiquidGlassMaterial::macos_dock_default();
+        let invalid = LiquidGlassMaterial {
+            chromatic_dispersion: material.ior,
+            ..material
+        };
+        assert!(matches!(
+            invalid.validate(64.0),
+            Err(LiquidGlassError::InvalidChromaticDispersion(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_panel_dimensions_and_all_nonfinite_optical_parameters() {
+        let material = LiquidGlassMaterial::macos_dock_default();
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0, 0.0] {
+            assert!(material.validate(invalid).is_err());
+        }
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0] {
+            for invalid_material in [
+                LiquidGlassMaterial {
+                    ior: invalid,
+                    ..material
+                },
+                LiquidGlassMaterial {
+                    chromatic_dispersion: invalid,
+                    ..material
+                },
+                LiquidGlassMaterial {
+                    corner_radius: invalid,
+                    ..material
+                },
+                LiquidGlassMaterial {
+                    bevel_width: invalid,
+                    ..material
+                },
+                LiquidGlassMaterial {
+                    kawase_offset: invalid,
+                    ..material
+                },
+                LiquidGlassMaterial {
+                    specular_intensity: invalid,
+                    ..material
+                },
+            ] {
+                assert!(
+                    invalid_material.validate(64.0).is_err(),
+                    "{invalid_material:?}"
+                );
+            }
+            for index in 0..4 {
+                let mut invalid_material = material;
+                invalid_material.tint_rgba[index] = invalid;
+                assert!(invalid_material.validate(64.0).is_err());
+            }
+        }
+        assert!(
+            LiquidGlassMaterial {
+                kawase_blur_passes: 7,
+                ..material
+            }
+            .validate(64.0)
+            .is_err()
+        );
+        assert!(
+            LiquidGlassMaterial {
+                kawase_offset: 0.0,
+                ..material
+            }
+            .validate(64.0)
+            .is_err()
+        );
+        assert!(
+            LiquidGlassMaterial {
+                tint_rgba: [1.1; 4],
+                ..material
+            }
+            .validate(64.0)
+            .is_err()
+        );
     }
 }

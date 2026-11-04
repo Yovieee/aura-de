@@ -1,49 +1,80 @@
-# Aura Desktop Environment (`aura-de`)
+# Aura Desktop Environment
 
-**Aura DE** is a bleeding-edge Linux Desktop Environment built from scratch in Rust on Wayland. Inspired by macOS spatial ergonomics and modern **Liquid Glass** optical design, Aura combines a [Smithay](https://crates.io/crates/smithay)-powered Wayland compositor with a real-time refractive shader pipeline, a continuous-curvature Menu Bar and parabolic Dock, a Spotlight-style command launcher, and a pure-Rust D-Bus & PipeWire session daemon layer.
+Aura DE is an experimental Linux desktop written in Rust, with a Wayland compositor and a macOS-inspired shell. The workspace separates pure layout/animation models, rendering, compositor, shell, launcher, and session management into six crates.
 
-## Architecture Highlights
+This is development software. The architecture describes the intended desktop; it is not a declaration that every feature is available. See [implementation status](docs/implementation-status.md) for implemented, tested, and outstanding work. In particular, a compiled native-backend feature does not establish a working DRM/KMS session or a PipeWire capture stream.
 
-* **Liquid Glass Optical Engine (`crates/aura-render`)**: Multi-pass [Dual-Kawase](https://blog.frost.kiwi/dual-kawase/) backdrop blur paired with $L_4$ superellipse (macOS continuous squircle) Signed Distance Field geometry, Snell's law edge refraction ($n = 1.48$), RGB chromatic dispersion, and Fresnel specular rim lighting in both GLES 3.0 and [wgpu](https://crates.io/crates/wgpu) WGSL.
-* **Pure Spatial & Spring Layout Core (`crates/aura-core`)**: Zero-I/O window manager supporting macOS floating stacking, Stage Manager side-strips, smart-snap tiling halves/quarters, parabolic Dock icon magnification, and interruptible 240Hz critically damped spring animations.
-* **Wayland Compositor & Touchpad Gestures (`crates/aura-compositor`)**: Built on [Smithay](https://crates.io/crates/smithay) and [Calloop](https://crates.io/crates/calloop) with support for `xdg-shell`, `wlr-layer-shell`, [ext-background-effect-v1](https://wayland.app/protocols/ext-background-effect-v1), 3-finger touchpad swipe gestures (`input.rs`), and Traffic Light window control hit-testing.
-* **Layer-Shell Menu Bar, Dock & IPC (`crates/aura-shell`)**: Built on [Smithay Client Toolkit (SCTK)](https://crates.io/crates/smithay-client-toolkit), [wgpu](https://crates.io/crates/wgpu), and [zbus](https://crates.io/crates/zbus) (`org.aura.Shell1` & `org.freedesktop.Notifications`).
-* **Spotlight Command Launcher (`crates/aura-launcher`)**: Fuzzy desktop entry search and quick command overlay rendered on the `wlr-layer-shell` `Overlay` layer.
-* **Session & PipeWire Portal Daemon (`crates/aura-session`)**: Evaluates fullscreen DRM/KMS direct-scanout bypass and exposes `org.freedesktop.impl.portal.ScreenCast` for zero-copy PipeWire DMA-BUF screen sharing.
+## Build on Linux
 
-## Repository Structure
-
-| Path | Description |
-| :--- | :--- |
-| `Cargo.toml` | Workspace manifest pinning shared dependencies across all 6 crates |
-| `crates/aura-core/` | Pure window layout, Stage Manager, spring physics, Dock magnification, and Liquid Glass material models + unit tests |
-| `crates/aura-render/` | Dual-Kawase blur & Liquid Glass refraction shaders (`.wgsl` and `.frag`) and `std140` uniform packers |
-| `crates/aura-compositor/` | Smithay + Calloop Wayland compositor binary (`aura-compositor`) + 3-finger gesture & Traffic Light input hit-testing |
-| `crates/aura-shell/` | Wayland `wlr-layer-shell` Menu Bar + Dock client and `zbus` D-Bus service (`aura-shell`) |
-| `crates/aura-launcher/` | Spotlight-style fuzzy app & command launcher overlay (`aura-launcher`) |
-| `crates/aura-session/` | Session bootstrapper, fullscreen direct-scanout evaluator, and PipeWire screencast portal (`aura-session`) |
-| `assets/ui-mockup.svg` | Vector architectural mockup of the Aura DE Liquid Glass desktop |
-| `DESIGN.md` | Comprehensive architecture specification and Liquid Glass optical math |
-| `AGENTS.md` | Contributor and AI agent guide with build, test, and safety boundaries |
-
-## Build, Test, and Run (Linux Host)
+Rust **1.99.1** is pinned in `rust-toolchain.toml`. Install Rust with rustup using its official installer, preserving TLS/checksum verification, then install the native packages needed by the selected backend:
 
 ```bash
-# 1. Copy default development configuration
-cp .env.example .env
+# Debian/Ubuntu, from the repository root:
+sudo bash scripts/install-deps.sh --testing
+# Optional DRM/input/session/PipeWire build dependencies:
+sudo bash scripts/install-deps.sh --native --testing
 
-# 2. Run automated workspace & mathematical verification
-python3 scripts/verify_workspace.py
-
-# 3. Run unit tests across the workspace on your Linux host
-cargo test --workspace
-
-# 4. Run the compositor smoke test or launch a nested winit development window
-cargo run -p aura-compositor -- --backend winit --smoke-test
-AURA_BACKEND=winit cargo run -p aura-compositor -- --backend winit
-
-# 5. Launch the Liquid Glass Menu Bar, Parabolic Dock, Spotlight Launcher, and Session Portal
-WAYLAND_DISPLAY=wayland-aura-0 cargo run -p aura-shell
-WAYLAND_DISPLAY=wayland-aura-0 cargo run -p aura-launcher
-cargo run -p aura-session
+cargo build --workspace --locked
 ```
+
+The default development backend is nested winit. For a user-local dependency sysroot, set `AURA_SYSROOT` and source `scripts/dev-env.sh` before Cargo commands; ordinary system installations do not require this helper.
+
+On Debian 13 without root access, `bash scripts/install-deps-user.sh --native --testing` downloads signed packages and extracts a workspace sysroot. Activate it with `export AURA_SYSROOT=/workspace/.cloud-setup/sysroot; source scripts/dev-env.sh`.
+
+`Cargo.lock` is retained for this application workspace. Refresh dependencies deliberately and review changes rather than resolving new dependency versions during every setup.
+
+## Validate
+
+```bash
+python3 scripts/verify_workspace.py
+cargo fmt --all -- --check
+cargo test -p aura-core --locked
+cargo check --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+python3 scripts/smoke_nested.py --software
+python3 scripts/integration_desktop.py --software
+python3 scripts/session_smoke.py --no-build
+```
+
+The Python structure check verifies manifests and source paths only. Rust tests exercise the implementation. The nested smoke script runs a real Wayland SHM client and waits for configure/frame events; it creates Xvfb when no host display is available. Mesa software rendering can validate the nested development path, but cannot validate a hardware DRM/KMS session or measure hardware performance. Smoke logs are written to `target/smoke-logs` by default.
+
+## Nested development
+
+Start the compositor inside an existing X11 or Wayland desktop:
+
+```bash
+cargo run --locked -p aura-compositor -- --backend winit --socket wayland-aura-0
+```
+
+In another terminal with the same `XDG_RUNTIME_DIR`, connect the clients to Aura's socket:
+
+```bash
+AURA_COMPOSITOR_GLASS=1 WAYLAND_DISPLAY=wayland-aura-0 cargo run --locked -p aura-shell
+AURA_COMPOSITOR_GLASS=1 WAYLAND_DISPLAY=wayland-aura-0 cargo run --locked -p aura-launcher
+```
+
+The compositor's host display and its server socket are distinct: keep the host `DISPLAY`/`WAYLAND_DISPLAY` for the compositor process, and set `WAYLAND_DISPLAY` to Aura's socket only for its clients. For supervised startup, run `AURA_COMPOSITOR_GLASS=1 cargo run --locked -p aura-session` from an existing desktop. A usable user session also needs a D-Bus session bus. See [session lifecycle](docs/wayland-protocols.md) and the session binary's `--help` before using session supervision.
+
+`.env.example` lists supported development settings; environment files are not loaded automatically. Export settings in your shell when needed. The compositor is the authority for window layout and backdrop capture; a normal Wayland client does not automatically receive other clients' pixels for blur.
+
+## Stage a development package
+
+```bash
+bash scripts/install.sh --prefix /usr --destdir /tmp/aura-package
+```
+
+This builds and stages binaries, documentation and licenses without starting a session or replacing desktop services. Optional `--with-session` installs a nested-preview session descriptor; it is not a bare-metal display-manager session. Optional `--with-portal` installs backend activation metadata, which does not enable ScreenCast until real capture transport is implemented. See [data/README.md](data/README.md).
+
+## Workspace
+
+| Crate | Responsibility |
+| --- | --- |
+| `aura-core` | Pure layout, focus/visibility, spring animation, Dock geometry and material validation |
+| `aura-render` | Shader sources, uniform packing and GPU rendering primitives |
+| `aura-compositor` | Wayland server, backend, surface lifecycle, input and composition |
+| `aura-shell` | Layer-shell panels, Dock and desktop D-Bus services |
+| `aura-launcher` | XDG desktop-entry search, launcher overlay and app execution |
+| `aura-session` | Session supervision and portal capability/lifecycle handling |
+
+[DESIGN.md](DESIGN.md) records the design targets. [AGENTS.md](AGENTS.md) documents contributor boundaries and checks. Aura DE is licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

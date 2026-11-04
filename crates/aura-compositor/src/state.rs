@@ -1,10 +1,10 @@
 //! Compositor state bridging `aura-core` layout/springs with Wayland surface lifecycles.
 
-use std::collections::HashMap;
 use aura_core::{
     GlassQualityPreset, LayoutMode, LiquidGlassMaterial, Rect, SnapZone, SpringConfig, SpringRect,
-    TrafficLightAction, WindowId, WorkspaceManager,
+    TrafficLightAction, WindowId, WindowStateFlags, WorkspaceManager,
 };
+use std::collections::HashMap;
 use tracing::info;
 
 #[derive(Debug, Clone)]
@@ -51,13 +51,8 @@ impl AuraCompositorState {
         self.workspace.add_window(id, app_id, title, initial_size);
         if let Some(node) = self.workspace.windows().iter().find(|w| w.id == id) {
             let r = node.computed_rect;
-            let spring = SpringRect::new(
-                r.x,
-                r.y,
-                r.width,
-                r.height,
-                SpringConfig::CRITICALLY_DAMPED,
-            );
+            let spring =
+                SpringRect::new(r.x, r.y, r.width, r.height, SpringConfig::CRITICALLY_DAMPED);
             self.window_springs.insert(id, spring);
             info!(
                 window_id = id,
@@ -102,10 +97,16 @@ impl AuraCompositorState {
     }
 
     pub fn tick_frame(&mut self, dt: f32) {
+        self.sync_spring_targets();
         self.frame_counter += 1;
         self.blur_regions.clear();
 
-        for win in self.workspace.windows() {
+        for win in self
+            .workspace
+            .windows()
+            .iter()
+            .filter(|w| !w.flags.contains(WindowStateFlags::MINIMIZED))
+        {
             let animated_rect = if let Some(spring) = self.window_springs.get_mut(&win.id) {
                 let (x, y, w, h) = spring.step(dt);
                 Rect::new(x, y, w, h)
@@ -120,5 +121,35 @@ impl AuraCompositorState {
                 elevation_px: 24.0,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn minimized_and_closed_windows_leave_frame_regions() {
+        let mut state = AuraCompositorState::new(1280., 800., GlassQualityPreset::Balanced);
+        state.map_xdg_window(1, "one", "One", (640., 480.));
+        state.map_xdg_window(2, "two", "Two", (640., 480.));
+        state.tick_frame(1. / 60.);
+        assert_eq!(state.blur_regions.len(), 2);
+        state.handle_traffic_light(2, TrafficLightAction::MinimizeToDock);
+        state.tick_frame(1. / 60.);
+        assert_eq!(
+            state
+                .blur_regions
+                .iter()
+                .map(|r| r.window_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        state.workspace.restore_window(2);
+        state.tick_frame(1. / 60.);
+        assert_eq!(state.blur_regions.len(), 2);
+        state.handle_traffic_light(1, TrafficLightAction::Close);
+        state.tick_frame(1. / 60.);
+        assert_eq!(state.blur_regions[0].window_id, 2);
+        assert!(!state.window_springs.contains_key(&1));
     }
 }

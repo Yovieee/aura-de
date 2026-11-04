@@ -11,3 +11,9 @@ aura-core = { path = "../aura-core" }
 bytemuck = { workspace = true }
 glam = { workspace = true }
 wgpu = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+naga = { version = "26.0.0", features = ["wgsl-in"] }
+futures-lite = "2.6.1"
+libloading = "0.8.9"

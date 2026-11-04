@@ -12,7 +12,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Yovieee/aura-de"
 
@@ -20,13 +20,8 @@ repository = "https://github.com/Yovieee/aura-de"
 # Core Wayland & Compositor Stack
 smithay = { version = "0.7.0", default-features = false, features = [
     "backend_winit",
-    "backend_drm",
-    "backend_gbm",
     "backend_egl",
-    "backend_libinput",
-    "backend_session_libseat",
     "renderer_gl",
-    "renderer_multi",
     "wayland_frontend",
     "desktop",
 ] }
@@ -54,4 +49,4 @@ toml = "0.8.20"
 thiserror = "2.0.11"
 tracing = { version = "0.1.41" }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-bitflags = "2.8.0"
+bitflags = { version = "2.8.0", features = ["serde"] }
