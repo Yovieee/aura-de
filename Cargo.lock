@@ -265,6 +265,7 @@ dependencies = [
 name = "aura-shell"
 version = "0.1.0"
 dependencies = [
+ "aura-core",
  "font8x8",
  "serde",
  "serde_json",
