@@ -282,6 +282,20 @@ impl WorkspaceManager {
         true
     }
 
+    /// Set the protocol fullscreen state without changing focus or restore geometry.
+    /// Repeated requests are idempotent. The previous maximized state remains set so
+    /// leaving fullscreen restores either the work area or the original floating rect.
+    pub fn set_fullscreen(&mut self, id: WindowId, fullscreen: bool) -> bool {
+        let Some(window) = self.windows.iter_mut().find(|window| window.id == id) else {
+            return false;
+        };
+        if window.flags.contains(WindowStateFlags::FULLSCREEN) != fullscreen {
+            window.flags.set(WindowStateFlags::FULLSCREEN, fullscreen);
+            self.recompute_layout();
+        }
+        true
+    }
+
     pub fn update_window_metadata(
         &mut self,
         id: WindowId,
@@ -640,5 +654,71 @@ mod tests {
             wm.recompute_layout();
             assert_eq!(wm.windows()[0].computed_rect, wm.usable_work_area());
         }
+    }
+
+    #[test]
+    fn fullscreen_is_idempotent_and_restores_floating_geometry_without_stealing_focus() {
+        let mut wm = WorkspaceManager::new(Rect::new(25.0, 50.0, 800.0, 600.0));
+        wm.add_window(1, "one", "One", (400.0, 300.0));
+        wm.add_window(2, "two", "Two", (300.0, 200.0));
+        let restore_rect = wm.windows()[0].floating_rect;
+        assert!(wm.set_fullscreen(1, true));
+        assert_eq!(wm.windows()[0].computed_rect, wm.output_rect);
+        assert_eq!(wm.windows()[0].floating_rect, restore_rect);
+        assert_eq!(focused_visible_ids(&wm), vec![2]);
+        let fullscreen = wm.windows().to_vec();
+        assert!(wm.set_fullscreen(1, true));
+        assert_eq!(wm.windows(), fullscreen);
+        assert!(wm.set_fullscreen(1, false));
+        assert_eq!(wm.windows()[0].computed_rect, restore_rect);
+        assert_eq!(wm.windows()[0].floating_rect, restore_rect);
+        assert_eq!(focused_visible_ids(&wm), vec![2]);
+        let restored = wm.windows().to_vec();
+        assert!(wm.set_fullscreen(1, false));
+        assert!(!wm.set_fullscreen(99, true));
+        assert_eq!(wm.windows(), restored);
+    }
+
+    #[test]
+    fn fullscreen_restores_maximize_and_survives_layout_and_output_changes() {
+        let mut wm = WorkspaceManager::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        wm.add_window(1, "one", "One", (400.0, 300.0));
+        let floating = wm.windows()[0].floating_rect;
+        wm.apply_traffic_light(1, TrafficLightAction::ToggleZoomFullscreen);
+        wm.set_fullscreen(1, true);
+        for mode in [
+            LayoutMode::Floating,
+            LayoutMode::StageManager,
+            LayoutMode::DynamicTiling,
+        ] {
+            wm.mode = mode;
+            wm.recompute_layout();
+            assert_eq!(wm.windows()[0].computed_rect, wm.output_rect);
+            assert!(wm.windows()[0].flags.contains(WindowStateFlags::MAXIMIZED));
+            assert!(!wm.windows()[0].flags.contains(WindowStateFlags::STAGED));
+        }
+        wm.resize_output(Rect::new(20.0, 40.0, 1200.0, 900.0));
+        assert_eq!(wm.windows()[0].computed_rect, wm.output_rect);
+        wm.set_fullscreen(1, false);
+        assert_eq!(wm.windows()[0].computed_rect, wm.usable_work_area());
+        assert_eq!(wm.windows()[0].floating_rect, floating);
+        assert_eq!(focused_visible_ids(&wm), vec![1]);
+    }
+
+    #[test]
+    fn fullscreen_request_does_not_restore_a_minimized_window() {
+        let mut wm = WorkspaceManager::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        wm.add_window(1, "one", "One", (400.0, 300.0));
+        wm.add_window(2, "two", "Two", (300.0, 200.0));
+        wm.apply_traffic_light(1, TrafficLightAction::MinimizeToDock);
+        let restore_rect = wm.windows()[0].floating_rect;
+        wm.set_fullscreen(1, true);
+        assert!(wm.windows()[0].flags.contains(WindowStateFlags::MINIMIZED));
+        assert_eq!(focused_visible_ids(&wm), vec![2]);
+        assert_eq!(wm.windows()[0].floating_rect, restore_rect);
+        wm.restore_window(1);
+        assert_eq!(wm.windows()[0].computed_rect, wm.output_rect);
+        wm.set_fullscreen(1, false);
+        assert_eq!(wm.windows()[0].computed_rect, restore_rect);
     }
 }

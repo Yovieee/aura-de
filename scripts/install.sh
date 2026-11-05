@@ -25,7 +25,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [--prefix /usr/local] [--destdir PATH] [--profile release|dev]"
             echo "          [--no-build] [--with-session] [--with-portal]"
             echo "Session descriptor is a nested preview, not a bare-metal login session."
-            echo "Portal descriptor reports capture unsupported; it does not enable screen sharing."
+            echo "Portal metadata requires a supervised capture source, PipeWire and explicit consent."
             exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac

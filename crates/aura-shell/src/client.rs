@@ -3,6 +3,7 @@ use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData},
     delegate_registry,
     output::{OutputHandler, OutputState},
+    reexports::{calloop::EventLoop, calloop_wayland_source::WaylandSource},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
@@ -19,6 +20,7 @@ use smithay_client_toolkit::{
     },
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
+use std::time::{Duration, Instant};
 use wayland_client::{
     Connection, QueueHandle,
     globals::registry_queue_init,
@@ -42,12 +44,26 @@ pub trait DesktopUi {
         false
     }
     fn pointer(&mut self, _panel: usize, _x: f64, _y: f64, _pressed: bool) {}
+    /// Consume a dirty flag after input or a background-state poll.
+    fn needs_redraw(&mut self) -> bool {
+        false
+    }
+    /// Poll asynchronous UI state without continuously committing idle frames.
+    fn tick_interval(&self) -> Option<Duration> {
+        None
+    }
+    /// Pointer actions may finish a modal UI without a keyboard event.
+    fn finished(&self) -> bool {
+        false
+    }
 }
 
 pub struct Canvas<'a> {
     pub pixels: &'a mut [u8],
     pub width: u32,
     pub height: u32,
+    /// Integer buffer scale. Dimensions and drawing coordinates remain logical.
+    pub scale: u32,
     /// True only when the session explicitly enables Aura compositor-owned glass.
     pub compositor_glass: bool,
 }
@@ -67,9 +83,21 @@ impl Canvas<'_> {
         }
     }
     pub fn rect(&mut self, x: i32, y: i32, width: u32, height: u32, color: u32) {
-        for row in y.max(0)..(y.saturating_add(height as i32)).min(self.height as i32) {
-            for col in x.max(0)..(x.saturating_add(width as i32)).min(self.width as i32) {
-                let i = (row as usize * self.width as usize + col as usize) * 4;
+        let scale = self.scale.max(1) as i32;
+        let stride = self.width as usize * scale as usize;
+        let left = x.max(0).saturating_mul(scale);
+        let top = y.max(0).saturating_mul(scale);
+        let right = x
+            .saturating_add_unsigned(width)
+            .min(self.width as i32)
+            .saturating_mul(scale);
+        let bottom = y
+            .saturating_add_unsigned(height)
+            .min(self.height as i32)
+            .saturating_mul(scale);
+        for row in top..bottom {
+            for col in left..right {
+                let i = (row as usize * stride + col as usize) * 4;
                 self.pixels[i..i + 4].copy_from_slice(&color.to_ne_bytes());
             }
         }
@@ -106,7 +134,11 @@ struct Panel {
     layer: LayerSurface,
     width: u32,
     height: u32,
+    scale: u32,
     configured: bool,
+    dirty: bool,
+    frame_pending: bool,
+    last_draw: Option<Instant>,
 }
 struct Client {
     registry: RegistryState,
@@ -128,7 +160,7 @@ pub fn run(
     ui: Box<dyn DesktopUi>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::connect_to_env()?;
-    let (globals, mut events) = registry_queue_init(&conn)?;
+    let (globals, events) = registry_queue_init(&conn)?;
     let qh = events.handle();
     let compositor = CompositorState::bind(&globals, &qh)?;
     let shell = LayerShell::bind(&globals, &qh)?;
@@ -150,7 +182,11 @@ pub fn run(
                 layer,
                 width: spec.width.max(1),
                 height: spec.height.max(1),
+                scale: 1,
                 configured: false,
+                dirty: true,
+                frame_pending: false,
+                last_draw: None,
             }
         })
         .collect();
@@ -169,28 +205,74 @@ pub fn run(
         frames: vec![0; panel_count],
         compositor_glass: std::env::var("AURA_COMPOSITOR_GLASS").is_ok_and(|value| value == "1"),
     };
-    while !state.exit {
-        events.blocking_dispatch(&mut state)?;
+    let mut event_loop = EventLoop::<Client>::try_new()?;
+    WaylandSource::new(conn, events)
+        .insert(event_loop.handle())
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    while !state.exit && !state.ui.finished() {
+        let tick = state
+            .ui
+            .tick_interval()
+            .map(|interval| interval.max(Duration::from_millis(33)));
+        let timeout = match (tick, state.redraw_delay()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        event_loop.dispatch(timeout, &mut state)?;
+        if state.ui.needs_redraw() {
+            for panel in &mut state.panels {
+                panel.dirty = true;
+            }
+        }
+        if !state.exit && !state.ui.finished() {
+            for index in 0..state.panels.len() {
+                state.draw(index, &qh);
+            }
+        }
     }
     Ok(())
 }
 impl Client {
+    fn redraw_delay(&self) -> Option<Duration> {
+        self.panels
+            .iter()
+            .filter(|panel| panel.configured && panel.dirty && !panel.frame_pending)
+            .map(|panel| {
+                panel.last_draw.map_or(Duration::ZERO, |draw| {
+                    Duration::from_millis(33).saturating_sub(draw.elapsed())
+                })
+            })
+            .min()
+    }
     fn draw(&mut self, index: usize, qh: &QueueHandle<Self>) {
         let panel = &self.panels[index];
-        if !panel.configured {
+        if !panel.configured
+            || !panel.dirty
+            || panel.frame_pending
+            || panel
+                .last_draw
+                .is_some_and(|draw| draw.elapsed() < Duration::from_millis(33))
+        {
             return;
         }
         let (w, h) = (panel.width, panel.height);
+        let (buffer_width, buffer_height) =
+            (w.saturating_mul(panel.scale), h.saturating_mul(panel.scale));
         // Bound allocations from compositor-provided sizes, including integer casts.
-        if w > 8192 || h > 8192 {
+        if buffer_width > 8192
+            || buffer_height > 8192
+            || u64::from(buffer_width) * u64::from(buffer_height) > 16 * 1024 * 1024
+        {
             tracing::error!(w, h, "Unsupported layer size");
             self.exit = true;
             return;
         }
-        let Ok((buffer, pixels)) =
-            self.pool
-                .create_buffer(w as i32, h as i32, w as i32 * 4, wl_shm::Format::Argb8888)
-        else {
+        let Ok((buffer, pixels)) = self.pool.create_buffer(
+            buffer_width as i32,
+            buffer_height as i32,
+            buffer_width as i32 * 4,
+            wl_shm::Format::Argb8888,
+        ) else {
             self.exit = true;
             return;
         };
@@ -200,11 +282,13 @@ impl Client {
                 pixels,
                 width: w,
                 height: h,
+                scale: panel.scale,
                 compositor_glass: self.compositor_glass,
             },
         );
         let surface = panel.layer.wl_surface();
-        surface.damage_buffer(0, 0, w as i32, h as i32);
+        surface.set_buffer_scale(panel.scale as i32);
+        surface.damage_buffer(0, 0, buffer_width as i32, buffer_height as i32);
         surface.frame(qh, FrameCallbackData(surface.clone()));
         if let Err(error) = buffer.attach_to(surface) {
             tracing::error!(%error,"Buffer attachment failed");
@@ -212,6 +296,10 @@ impl Client {
             return;
         }
         panel.layer.commit();
+        let panel = &mut self.panels[index];
+        panel.dirty = false;
+        panel.frame_pending = true;
+        panel.last_draw = Some(Instant::now());
     }
 }
 impl CompositorHandler for Client {
@@ -219,9 +307,17 @@ impl CompositorHandler for Client {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: i32,
+        surface: &wl_surface::WlSurface,
+        scale: i32,
     ) {
+        if let Some(panel) = self
+            .panels
+            .iter_mut()
+            .find(|p| p.layer.wl_surface() == surface)
+        {
+            panel.scale = scale.max(1) as u32;
+            panel.dirty = true;
+        }
     }
     fn transform_changed(
         &mut self,
@@ -234,7 +330,7 @@ impl CompositorHandler for Client {
     fn frame(
         &mut self,
         _: &Connection,
-        qh: &QueueHandle<Self>,
+        _: &QueueHandle<Self>,
         surface: &wl_surface::WlSurface,
         _: u32,
     ) {
@@ -244,11 +340,13 @@ impl CompositorHandler for Client {
             .position(|p| p.layer.wl_surface() == surface)
         {
             self.frames[i] += 1;
+            self.panels[i].frame_pending = false;
             if self.smoke && self.frames.iter().all(|n| *n >= 2) {
                 tracing::info!("Layer-shell configure/SHM attach/frame smoke test passed");
                 self.exit = true;
-            } else {
-                self.draw(i, qh);
+            } else if self.smoke && self.frames[i] < 2 {
+                // The explicit smoke mode exercises a second buffer/frame cycle.
+                self.panels[i].dirty = true;
             }
         }
     }
@@ -284,7 +382,7 @@ impl LayerShellHandler for Client {
     fn configure(
         &mut self,
         _: &Connection,
-        qh: &QueueHandle<Self>,
+        _: &QueueHandle<Self>,
         layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _: u32,
@@ -298,7 +396,7 @@ impl LayerShellHandler for Client {
                 p.height = configure.new_size.1;
             }
             p.configured = true;
-            self.draw(i, qh);
+            p.dirty = true;
         }
     }
 }
@@ -377,6 +475,9 @@ impl KeyboardHandler for Client {
         event: KeyEvent,
     ) {
         self.exit |= self.ui.key(event.keysym.raw(), event.utf8.as_deref());
+        for panel in &mut self.panels {
+            panel.dirty = true;
+        }
     }
     fn repeat_key(
         &mut self,
@@ -429,6 +530,7 @@ impl PointerHandler for Client {
                     event.position.1,
                     matches!(event.kind, PointerEventKind::Press { button: 0x110, .. }),
                 );
+                self.panels[i].dirty = true;
             }
         }
     }
@@ -457,6 +559,7 @@ mod tests {
             pixels: &mut pixels,
             width: 2,
             height: 2,
+            scale: 1,
             compositor_glass: false,
         };
         canvas.panel_background(0xff182230, false);
@@ -469,5 +572,27 @@ mod tests {
         assert!(canvas.pixels[4..].iter().all(|p| *p == 0));
         canvas.panel_background(0xff182230, true);
         assert_eq!(&canvas.pixels[..4], &0xff182230u32.to_ne_bytes());
+    }
+    #[test]
+    fn hidpi_rect_uses_physical_pixels_and_logical_coordinates() {
+        let mut pixels = [0u8; 64];
+        let mut canvas = Canvas {
+            pixels: &mut pixels,
+            width: 2,
+            height: 2,
+            scale: 2,
+            compositor_glass: false,
+        };
+        canvas.rect(1, 0, 1, 1, 0xff123456);
+        for y in 0..4 {
+            for x in 0..4 {
+                let offset = (y * 4 + x) * 4;
+                let expected = if y < 2 && x >= 2 { 0xff123456u32 } else { 0 };
+                assert_eq!(&canvas.pixels[offset..offset + 4], &expected.to_ne_bytes());
+            }
+        }
+        // Clipping stays safe at negative logical coordinates.
+        canvas.rect(-1, -1, 2, 2, 0xffabcdef);
+        assert_eq!(&canvas.pixels[..4], &0xffabcdefu32.to_ne_bytes());
     }
 }

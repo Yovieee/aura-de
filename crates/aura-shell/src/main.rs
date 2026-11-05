@@ -18,6 +18,11 @@ struct Window {
 struct RuntimeState {
     windows: Vec<Window>,
     status: String,
+    sharing: usize,
+}
+#[derive(serde::Deserialize)]
+struct CompositorStatus {
+    capture_subscribers: usize,
 }
 enum Action {
     Control(String),
@@ -29,12 +34,50 @@ struct Shell {
     runtime: Arc<Mutex<RuntimeState>>,
     apps: Vec<DesktopEntryItem>,
     actions: mpsc::Sender<Action>,
+    redraw_fingerprint: Option<u64>,
+    menu_width: u32,
 }
 impl DesktopUi for Shell {
+    fn needs_redraw(&mut self) -> bool {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hash = DefaultHasher::new();
+        {
+            let state = self.state.lock().unwrap();
+            state.reduced_transparency.hash(&mut hash);
+            state.do_not_disturb.hash(&mut hash);
+            state.notifications.len().hash(&mut hash);
+            if let Some(notification) = state.notifications.values().next_back() {
+                (&notification.app, &notification.summary, &notification.body).hash(&mut hash);
+            }
+        }
+        {
+            let runtime = self.runtime.lock().unwrap();
+            runtime.status.hash(&mut hash);
+            runtime.sharing.hash(&mut hash);
+            for window in runtime.windows.iter().take(6) {
+                (
+                    window.id,
+                    &window.app_id,
+                    &window.title,
+                    window.minimized,
+                    window.focused,
+                )
+                    .hash(&mut hash);
+            }
+        }
+        let fingerprint = hash.finish();
+        let changed = self.redraw_fingerprint != Some(fingerprint);
+        self.redraw_fingerprint = Some(fingerprint);
+        changed
+    }
+    fn tick_interval(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_millis(100))
+    }
     fn draw(&mut self, panel: usize, c: &mut Canvas<'_>) {
         let reduced = self.state.lock().unwrap().reduced_transparency;
         c.panel_background(0xff182230, reduced);
         if panel == 0 {
+            self.menu_width = c.width;
             c.text(
                 12,
                 10,
@@ -43,18 +86,24 @@ impl DesktopUi for Shell {
                 1,
             );
             let state = self.state.lock().unwrap();
+            let sharing = self.runtime.lock().unwrap().sharing > 0;
             let label = if state.do_not_disturb {
                 "DND"
             } else {
                 "Notifications"
             };
             c.text(
-                c.width.saturating_sub(180) as i32,
+                c.width.saturating_sub(if sharing { 380 } else { 180 }) as i32,
                 10,
                 &format!("{label}: {}", state.notifications.len()),
                 0xffb8c8dc,
                 1,
             );
+            if sharing {
+                let x = c.width.saturating_sub(192) as i32;
+                c.rect(x, 4, 184, 24, 0xffa12835);
+                c.text(x + 12, 12, "SHARING | Stop", 0xffffffff, 1);
+            }
         } else {
             c.text(12, 12, "Apps", 0xff9bcaff, 1);
             for (i, app) in self.apps.iter().take(5).enumerate() {
@@ -118,6 +167,17 @@ impl DesktopUi for Shell {
             return;
         }
         let action = if panel == 0 {
+            if self.runtime.lock().unwrap().sharing > 0
+                && (f64::from(self.menu_width.saturating_sub(192))
+                    ..f64::from(self.menu_width.saturating_sub(8)))
+                    .contains(&x)
+                && (4.0..28.0).contains(&y)
+            {
+                let _ = self
+                    .actions
+                    .send(Action::Control("stop-screen-sharing".into()));
+                return;
+            }
             let mode = if (80.0..160.0).contains(&x) {
                 Some("floating")
             } else if (168.0..280.0).contains(&x) {
@@ -203,6 +263,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 worker_state.lock().unwrap().windows = windows;
             }
+            if let Ok(json) = ipc::control_command("status")
+                && let Ok(status) = serde_json::from_str::<CompositorStatus>(&json)
+            {
+                worker_state.lock().unwrap().sharing = status.capture_subscribers;
+            }
         }
     });
     let specs = vec![
@@ -232,6 +297,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             runtime,
             apps: desktop::discover(),
             actions: tx,
+            redraw_fingerprint: None,
+            menu_width: 0,
         }),
     )
 }

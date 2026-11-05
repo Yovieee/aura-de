@@ -1,48 +1,65 @@
 # Implementation and verification status
 
-Updated 2026-11-04. The original `0.1.0` labels described design slices. This implementation establishes a **nested, single-output development desktop**, with the remaining hardware and capture work listed separately.
+Updated 2026-11-05. Aura is a **nested, single-output development desktop**. The original `0.1.0` labels described design slices; the results below are actual current-instance checks, with hardware and compatibility limits stated separately.
 
-## Acceptance gates
+## Implemented behavior and limits
 
 | Area | Implemented and observed | Remaining limits |
 | --- | --- | --- |
-| Build baseline | Rust 1.99.1 pin, tracked lockfile, standalone core tests, workspace check/test/strict Clippy and optional native-dependency feature check | CI configuration is committed as source only; no remote CI run is claimed |
-| Pure core | Focus/visibility/restore/close invariants, bounded geometry, analytical stall-safe spring, finite/range material validation; 19 tests passed | Layout/physics remain independent of I/O and GPU |
-| Nested compositor | Real Wayland socket, SHM/xdg-shell, output/seat, keyboard/pointer, move/resize requests, clipboard focus, maximize, map/unmap/remap and popups | One output; hardware DMA-BUF import, XWayland, server-side decorations, fullscreen policy and comprehensive protocol conformance remain unfinished |
-| Window lifecycle | Two real clients; focus/minimize/restore; repeated maximize; NULL unmap/new configure/remap; popup SHM buffers/frame callbacks; close and disconnect cleanup | Stage Manager is a layout mode, not full live-thumbnail/grouping UX; spring position changes are rendered, size transitions are not resampled animations |
-| Shell and launcher | Real layer-shell menu bar/Dock/overlay, NULL unmap releases exclusive reservation and remap restores it; real XDG entry index and shell-free app execution | Fixed bitmap font, one default output, no terminal-only or D-Bus-activation-only entries, no live entry-index reload |
-| D-Bus services | `org.aura.Shell1` controls actual compositor state; freedesktop notification replacement/close/expiry/DND tested on a private bus | Notification action handling, advanced desktop controls and broader compatibility remain future work |
-| Glass GPU engine | wgpu real blur/refraction/readback tests; GLES canonical/Smithay shader compilation; compositor captures actual scene, executes blur and composites glass behind authorized shell namespaces | Compositor path is SDR RGBA8 and redraws full frames; cached damage/idle scheduling, HDR/color management and hardware performance targets are not complete |
-| Session supervision | Actual compositor/shell startup, Dock pointer input, launcher keyboard/Escape, real desktop-entry app execution, SIGTERM/reap and socket cleanup tested | Nested session only; no bare-metal display-manager login, VT switch, hotplug or suspend/resume validation |
-| Portal ScreenCast | Standard D-Bus method/session/request lifecycle, ownership and cleanup tested; reports zero capture capabilities and explicit NotSupported | No compositor capture transport, consent UI or PipeWire node delivering frames; screen sharing is not implemented |
+| Build baseline | Rust 1.99.1 pin, tracked lockfile, standalone core tests, workspace check/test/strict Clippy and optional native-dependency feature check | The CI workflow is configured; no remote CI run is claimed |
+| Pure core | Focus/visibility/restore/close invariants, bounded geometry, analytical stall-safe spring, finite/range material validation and fullscreen geometry policy; 22 standalone tests passed | Layout/physics remain independent of I/O and GPU |
+| Nested compositor | Real Wayland socket, SHM/xdg-shell, output/seat, keyboard/pointer, move/resize requests, clipboard focus, maximize, map/unmap/remap, popups, fullscreen and negotiated server-side decorations | One output; hardware DMA-BUF import, XWayland and comprehensive client-conformance coverage remain unfinished |
+| Window lifecycle and chrome | Two real clients; focus/minimize/restore; repeated maximize; NULL unmap/new configure/remap; popup buffers/frame callbacks; fullscreen transitions and initial pre-map fullscreen with both client/server decorations; titlebar drag and traffic-light controls | Stage Manager is a layout mode, not full live-thumbnail/grouping UX; position springs render, while size transitions are not resampled animations |
+| Shell and launcher | Real layer-shell menu bar/Dock/overlay, exclusive reservation release/remap, XDG entry index and shell-free app execution | Fixed bitmap font, one default output, no terminal-only or D-Bus-activation-only entries, no live entry-index reload |
+| D-Bus services | `org.aura.Shell1` controls compositor state; freedesktop notification replacement/close/expiry/DND tested on a private bus | Notification actions, advanced desktop controls and broader application compatibility remain future work |
+| Glass and idle rendering | Actual wgpu/GLES blur/refraction; compositor-owned glass; retained scene/blur textures; unchanged-frame suppression and cache invalidation verified through counters | Dirty outputs redraw full frames. Regional damage, HDR/color management and hardware performance are not established; active capture deliberately requests periodic frames |
+| Session supervision | Actual compositor/shell startup, Dock pointer input, launcher keyboard/Escape, desktop-entry app execution, SIGTERM/reap and socket cleanup tested | Nested session only; no bare-metal display-manager login, VT switch, hotplug or suspend/resume validation |
+| Portal ScreenCast | Real composed pixels through asynchronous PBO readback and PipeWire; default-deny consent, sharing indicator/Stop above fullscreen, request cancellation, fresh consent, session Close and frontend-disconnect cleanup passed | One monitor, hidden cursor, fixed-size SDR RGBA up to 4096 pixels per axis. Resize/source loss ends the stream. No persistent permission, zero-copy, HDR or multioutput claim |
+| Capture access boundary | Raw source checks a per-session capability plus kernel peer PID/UID for the supervisor. Portal requests check the current standard frontend bus-name owner and bind session ownership to its unique sender/application ID | Application ID is supplied by the trusted frontend; the backend does not independently authenticate arbitrary native app identities or attest the frontend executable |
 | Direct scanout | Conservative eligibility model tests require coverage, buffer/plane/output constraints and atomic-test evidence | No active DRM/KMS scanout implementation |
-| Packaging | Development staging script, binaries, licenses and opt-in preview/portal descriptors | A nested development package is not a native desktop release |
+| Packaging and setup | Development staging with licenses and opt-in descriptors; repeatable signed Debian rootless setup and native dependency activation | Development packaging is not a native desktop release or a fresh cloud snapshot |
 
-## Validation record
+## Current validation results
 
-Commands run on Debian 13, with verified user-local native dependencies, Rust 1.99.1 and Mesa 25.0.7 llvmpipe software rendering:
+Checks ran on Debian 13, Rust 1.99.1, Mesa 25.0.7 llvmpipe and PipeWire 1.4.2. Rootless setup extracted **85 SHA-256-verified Debian packages**; a clean activation resolved libclang, gdbus, PipeWire and native dependency metadata using the host-overlay sysroot. This prepares compilation/runtime dependencies and does not establish hardware support.
 
-- `python3 scripts/verify_workspace.py`: passed structural checks; it does not claim mathematical/runtime verification.
-- `cargo fmt --all --check`: passed.
-- `cargo clippy --workspace --all-targets --locked --offline -- -D warnings`: passed.
-- `cargo check --workspace --all-targets --all-features --locked --offline`: passed; native feature here means optional dependency compilation, not a working hardware backend.
-- `cargo test --workspace --locked --offline`: 37 tests passed, 0 failed; 3 driver/private-bus tests intentionally ignored in the default command and explicitly executed below. Zero-test binaries/doc-test runs are not counted as validation.
-- `cargo test -p aura-render --test gpu --locked --offline -- --ignored --nocapture`: 1 passed on llvmpipe; verifies rendered pixels, blur versus sharp, clipping/premultiplication, opaque fallback and resize.
-- `cargo test -p aura-render --test gles --locked --offline -- --ignored --nocapture`: 1 passed; compiles/links canonical GLES3 programs and Smithay define variants through a real EGL driver.
-- `dbus-run-session -- cargo test -p aura-session portal_dbus_lifecycle --locked --offline -- --ignored`: 1 passed; this proves lifecycle and honest unsupported capture behavior, not screen sharing.
-- `dbus-run-session -- cargo run -p aura-shell --example dbus_smoke --locked --offline`: passed actual notification and D-Bus behavior checks.
-- `python3 scripts/smoke_nested.py --no-build --software`: passed real SHM configure/commit/frame smoke. A silent protocol server also correctly fails the client timeout.
-- `python3 scripts/integration_desktop.py --no-build --software`: passed layer NULL-unmap/remap reservation checks, two real clients, maximize idempotence, client remap/popup, focus/minimize/restore, layout/quality, shell/launcher frame callbacks, close/disconnect and socket cleanup.
-- `python3 scripts/session_smoke.py --no-build`: passed real supervised startup, synthetic pointer/keyboard input restricted to a private Xvfb, Dock opening launcher, Escape closing it, actual XDG app execution, process shutdown and socket cleanup.
+| Command or check | Result |
+| --- | --- |
+| `python3 scripts/verify_workspace.py` | Passed structural checks; no mathematical/runtime claim is inferred from this script |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo check --workspace --all-targets --all-features --locked` | Passed; optional native feature means dependency compilation, not a hardware backend |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | Passed |
+| `cargo test -p aura-core --locked` | 22 passed, 0 failed |
+| `cargo test --workspace --locked` | **69 passed, 0 failed, 6 intentionally ignored**; all six ignored tests were explicitly executed below. Zero-test binaries/doc-test runs are not counted as behavioral evidence |
+| `cargo test -p aura-render --test gpu --locked -- --ignored --nocapture` | 1 passed; rendered pixels, blur/sharp comparison, clipping/premultiplication, opaque fallback and resize |
+| `cargo test -p aura-render --test gles --locked -- --ignored --nocapture` | 1 passed; canonical GLES3 and Smithay shader variants compiled/linked through an actual EGL driver |
+| Explicit compositor `capture::tests::gles_pbo_capture_preserves_pack_state_and_reads_composed_rows` with `--ignored --exact` | 1 passed; real asynchronous PBO readback, composed row order, pack-state preservation and revocation of queued work |
+| Private-bus `portal_dbus_lifecycle` and `portal_dbus_consent_denial_and_request_cancellation` with `--ignored` | 2 passed; request/session ownership, capability behavior, consent denial and cancellation |
+| Session `capture::tests::saturated_backlog_connect_is_bounded_and_cancellable` with `--ignored --exact` | 1 passed; actual saturated Unix listener queue, bounded timeout and cancellation |
+| `dbus-run-session -- cargo run -p aura-shell --example dbus_smoke --locked` | Passed actual notification and shell D-Bus checks |
+| `python3 scripts/smoke_nested.py --no-build --software` | Passed real SHM configure/commit/frame smoke; silent-protocol timeout was also checked |
+| `python3 scripts/integration_desktop.py --no-build --software` | Passed layer unmap/remap reservation, two-client lifecycle, maximize/remap/popup, focus/minimize/restore, layout/quality and socket cleanup |
+| `python3 scripts/session_smoke.py --no-build` | Passed real supervised startup, isolated pointer/keyboard input, Dock/launcher, actual app execution, shutdown/reap and socket cleanup |
+| `python3 scripts/window_render_smoke.py --no-build` | Passed idle/cache counters, server-chrome minimize/restore, 64 px titlebar drag and close |
+| `python3 crates/aura-session/tests/pipewire_roundtrip.py` | Passed 10 real PipeWire frames with exact 2×2 RGBA bytes, authenticated no-frame probe separation and node cleanup |
+| `python3 scripts/screencast_smoke.py --no-build` | Passed actual consent, compositor pixels over PipeWire, changed-scene checksums, Stop above fullscreen, fresh consent, explicit close, cancellation and disconnect cleanup |
 
-Graphical test logs are retained in `target/smoke-logs`, `target/desktop-smoke-logs` and `target/session-smoke-logs`. A software GPU is useful evidence for this nested path; it provides no evidence about target hardware frame time, DRM/KMS, VT switching or native power management.
+The six explicit ignored-test passes comprise three GPU/PBO tests, two private-bus tests and one Unix-backlog test. They remain ignored in the default command because they require drivers, private buses or real sockets. CI runs them explicitly, builds real capture examples, preserves pipeline exit status and uploads artifacts. See [ScreenCast validation](screencast.md) for exact driver/socket commands.
 
-## Next required work
+## Retained runtime evidence
 
-1. Finish nested protocol coverage and desktop ergonomics: fullscreen/decorations, popup keyboard-grab coverage, output scaling, complete animation/Stage Manager UX and accessibility.
-2. Implement damage/idle scheduling and benchmark a named GPU/driver target; validate blur ordering for overlapping surfaces and broader color/alpha cases.
-3. Implement and validate DRM/KMS + libseat/logind/libinput on a machine exposing real GPU/seat devices. This cloud machine exposes no `/dev/dri`.
-4. Implement real compositor-to-PipeWire capture plus consent and teardown; then enable portal capture capabilities and verify frames with a real portal consumer.
-5. Validate multioutput, suspend/resume, VT switching and packaging before calling this a native alpha desktop release.
+`target/window-render-smoke-logs/results.json` records unchanged idle counters over 300 ms: initially 7 rendered frames, 4 scene captures and 16 blur passes. A foreground-only shell update changes frames to 8 while capture/blur remain 4/16. A quality change reaches 9/4/22, reusing the scene capture. Real input minimizes/restores the client, drags its titlebar 64 pixels left and closes it.
 
-The development environment and code are reviewable now. Publication of the cloud snapshot, a remote CI run, and validation in a fresh task are separate operations and are not claimed here.
+`target/screencast-smoke-logs/results.json` records default denial and request cancellation with no subscription, followed by a real 1024×640 PipeWire stream. Each consumer verifies ten frames; adding a real client changes the checksum from `ce64b98b2664918a` to `b87696d3d01c05f3`. Stop remains usable above a fullscreen client and removes the subscription/node. Fresh consent starts another stream; explicit close and frontend disconnect remove resources again.
+
+Other logs are retained in `target/smoke-logs`, `target/desktop-smoke-logs` and `target/session-smoke-logs`. A software GPU provides no evidence about target hardware frame time, DRM/KMS, VT switching or native power management. The PipeWire exact-pixel fixture verifies transport separately from the full compositor integration; neither substitutes for broader desktop application compatibility testing.
+
+## Remaining work
+
+1. Broaden client protocol, popup keyboard-grab, scaling, animation/Stage Manager UX and accessibility coverage.
+2. Extend regional damage handling and benchmark a named GPU/driver target; test overlapping glass surfaces and broader color/alpha cases.
+3. Implement and validate DRM/KMS plus libseat/logind/libinput on hardware. This cloud machine exposes no `/dev/dri`.
+4. Validate real desktop portal frontend/application compatibility. Extend capture through explicit negotiation/tests before adding other cursor modes, resize continuation, window sources, multioutput, HDR or zero-copy transport.
+5. Validate multioutput, suspend/resume, VT switching and installation on target machines before calling this a native alpha desktop release.
+
+Reusable cloud install/start instructions have been saved to the configuration draft. Publication of a new snapshot, a remote CI run and validation in a fresh task are separate operations and are not claimed here.

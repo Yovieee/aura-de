@@ -1,7 +1,7 @@
 use std::{
     ffi::OsString,
-    io,
-    os::unix::fs::PermissionsExt,
+    io::{self, Read},
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::ExitStatus,
     time::Duration,
@@ -22,7 +22,9 @@ Usage: aura-session [--backend winit] [--socket NAME] [--compositor PATH] [--she
 \nStarts a compositor, waits for its Wayland socket, then starts the shell.\n\
 SIGINT/SIGTERM or a child exiting stops and reaps the session's process groups.\n\
 If there is no session bus, dbus-run-session creates one.\n\
-ScreenCast is explicitly unsupported until compositor capture transport exists.";
+ScreenCast requires this session's authenticated capture source, a running PipeWire daemon,\n\
+and explicit approval in the screen-sharing consent overlay. Standalone --portal\n\
+does not inherit screen capture capabilities.";
 
 #[derive(Debug)]
 pub struct Options {
@@ -121,6 +123,20 @@ fn validate_socket_name(name: &str) -> io::Result<()> {
     }
 }
 
+/// Capabilities are generated in memory for this session and passed only to its
+/// compositor. They are never exported to the shell, applications or D-Bus
+/// activation environment, and must never be included in diagnostics.
+fn capture_config(runtime: &Path) -> io::Result<crate::capture::CaptureConfig> {
+    let mut bytes = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let token = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(crate::capture::CaptureConfig {
+        socket: runtime.join("aura-capture.sock"),
+        token,
+        remote: std::env::var("PIPEWIRE_REMOTE").ok(),
+    })
+}
+
 struct RuntimeDirectory {
     path: PathBuf,
     owned: bool,
@@ -133,6 +149,13 @@ impl RuntimeDirectory {
             if !path.is_absolute() || !path.is_dir() {
                 return Err(invalid(
                     "XDG_RUNTIME_DIR must be an existing absolute directory",
+                ));
+            }
+            let metadata = std::fs::metadata(&path)?;
+            if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o077 != 0
+            {
+                return Err(invalid(
+                    "XDG_RUNTIME_DIR must be owned by this user and private (mode 0700)",
                 ));
             }
             return Ok(Self { path, owned: false });
@@ -264,12 +287,27 @@ pub async fn run(options: Options) -> io::Result<()> {
             ),
         ));
     }
+    let capture = options
+        .portal
+        .then(|| capture_config(&runtime.path))
+        .transpose()?;
     let mut compositor_command = Command::new(&options.compositor);
     compositor_command
         .args(["--backend", &options.backend, "--socket", &options.socket])
         .env("XDG_RUNTIME_DIR", &runtime.path)
         .env("AURA_WAYLAND_DISPLAY", &options.socket)
         .env("XDG_CURRENT_DESKTOP", "Aura");
+    if let Some(capture) = &capture {
+        compositor_command
+            .env("AURA_CAPTURE_SOCKET", &capture.socket)
+            .env("AURA_CAPTURE_TOKEN", &capture.token)
+            .env("AURA_CAPTURE_OWNER_PID", std::process::id().to_string());
+    } else {
+        compositor_command
+            .env_remove("AURA_CAPTURE_SOCKET")
+            .env_remove("AURA_CAPTURE_TOKEN")
+            .env_remove("AURA_CAPTURE_OWNER_PID");
+    }
     // Preserve host WAYLAND_DISPLAY/DISPLAY for winit. Only clients get the new socket.
     let mut compositor = ManagedChild::spawn("aura-compositor", &mut compositor_command)?;
     let ready = tokio::select! {
@@ -289,7 +327,10 @@ pub async fn run(options: Options) -> io::Result<()> {
             .env("WAYLAND_DISPLAY", &options.socket)
             .env("AURA_WAYLAND_DISPLAY", &options.socket)
             .env("XDG_CURRENT_DESKTOP", "Aura")
-            .env("XDG_SESSION_TYPE", "wayland");
+            .env("XDG_SESSION_TYPE", "wayland")
+            .env_remove("AURA_CAPTURE_SOCKET")
+            .env_remove("AURA_CAPTURE_TOKEN")
+            .env_remove("AURA_CAPTURE_OWNER_PID");
         match ManagedChild::spawn("aura-shell", &mut command) {
             Ok(child) => Some(child),
             Err(error) => {
@@ -301,8 +342,21 @@ pub async fn run(options: Options) -> io::Result<()> {
         None
     };
 
-    let _portal = if options.portal {
-        match crate::portal::serve().await {
+    let _portal = if let Some(capture) = capture {
+        let consent = crate::portal::ConsentUi {
+            program: sibling_or_path("aura-launcher"),
+            wayland_display: options.socket.clone().into(),
+            runtime_dir: runtime.path.clone(),
+        };
+        let result = tokio::select! {
+            service = crate::portal::serve_with_capture(capture, consent) => service,
+            () = shutdown.wait() => {
+                if let Some(shell) = &mut shell { shell.stop().await; }
+                compositor.stop().await;
+                return Ok(());
+            }
+        };
+        match result {
             Ok(service) => Some(service),
             Err(error) => {
                 warn!(%error, "portal backend could not be exported; desktop continues without ScreenCast");
@@ -347,6 +401,41 @@ mod tests {
 
     fn parse(args: &[&str]) -> io::Result<ParseResult> {
         Options::parse(args.iter().map(|arg| arg.to_string()))
+    }
+
+    #[test]
+    fn capture_capabilities_are_unique_and_not_debug_logged() {
+        let first = capture_config(Path::new("/tmp/aura-capability-test")).unwrap();
+        let second = capture_config(Path::new("/tmp/aura-capability-test")).unwrap();
+        assert_eq!(first.token.len(), 64);
+        assert!(first.token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(
+            first.token != second.token,
+            "sessions must not reuse capture capabilities"
+        );
+        assert!(
+            !format!("{first:?}").contains(&first.token),
+            "capability must be redacted from Debug"
+        );
+    }
+
+    #[test]
+    fn capture_session_rejects_a_shared_runtime_directory() {
+        let path = std::env::temp_dir().join(format!(
+            "aura-runtime-permission-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(RuntimeDirectory::prepare(Some(path.clone().into())).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let prepared = RuntimeDirectory::prepare(Some(path.clone().into())).unwrap();
+        drop(prepared);
+        assert!(
+            path.exists(),
+            "caller-owned runtime directories must be preserved"
+        );
+        std::fs::remove_dir(path).unwrap();
     }
 
     #[test]

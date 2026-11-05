@@ -14,7 +14,7 @@ use smithay::{
         allocator::Fourcc,
         renderer::{
             Bind, Color32F, Frame, Offscreen, Renderer, Texture,
-            element::surface::WaylandSurfaceRenderElement,
+            element::{RenderElement, surface::WaylandSurfaceRenderElement},
             gles::{
                 GlesError, GlesFrame, GlesRenderer, GlesTarget, GlesTexProgram, GlesTexture,
                 Uniform, UniformName, UniformType, ffi,
@@ -42,6 +42,81 @@ pub struct GlassPanel {
     pub rect: Rect,
     pub material: LiquidGlassMaterial,
     pub elevation_px: f32,
+}
+
+/// GPU work encoded since the renderer was created. A blur pass is one
+/// downsample or upsample draw, rather than one entire blur pyramid.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct GlassStats {
+    pub scene_captures: u64,
+    pub blur_passes: u64,
+    /// The scene currently retained in the backdrop texture, if valid.
+    pub scene_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SceneKey {
+    generation: u64,
+    size: (i32, i32),
+    scale_bits: u64,
+    clear_bits: [u32; 4],
+}
+
+impl SceneKey {
+    fn new(generation: u64, size: Size<i32, Physical>, scale: f64, clear: Color32F) -> Self {
+        Self {
+            generation,
+            size: (size.w, size.h),
+            scale_bits: scale.to_bits(),
+            clear_bits: clear.components().map(f32::to_bits),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlurKey {
+    scene: SceneKey,
+    passes: u32,
+    offset_bits: u32,
+}
+
+impl BlurKey {
+    fn new(scene: SceneKey, material: &LiquidGlassMaterial) -> Self {
+        Self {
+            scene,
+            passes: material.kawase_blur_passes,
+            offset_bits: material.kawase_offset.to_bits(),
+        }
+    }
+}
+
+/// Keys become valid only after the corresponding GPU commands finish encoding.
+/// The caller invalidates both keys after any failed frame, because a failed
+/// command can leave either retained texture partially overwritten.
+#[derive(Debug, Default)]
+struct BackdropCache {
+    scene: Option<SceneKey>,
+    blurred: Option<BlurKey>,
+}
+
+impl BackdropCache {
+    fn capture_needed(&self, scene: SceneKey) -> bool {
+        self.scene != Some(scene)
+    }
+
+    fn blur_needed(&self, blur: BlurKey) -> bool {
+        self.blurred != Some(blur)
+    }
+
+    fn captured(&mut self, scene: SceneKey) {
+        self.scene = Some(scene);
+        self.blurred = None;
+    }
+
+    fn invalidate(&mut self) {
+        self.scene = None;
+        self.blurred = None;
+    }
 }
 
 struct Buffers {
@@ -113,6 +188,8 @@ pub struct GlassRenderer {
     down_program: GlesTexProgram,
     up_program: GlesTexProgram,
     buffers: Buffers,
+    cache: BackdropCache,
+    stats: GlassStats,
 }
 
 impl GlassRenderer {
@@ -140,6 +217,8 @@ impl GlassRenderer {
             down_program,
             up_program,
             buffers,
+            cache: BackdropCache::default(),
+            stats: GlassStats::default(),
         })
     }
 
@@ -151,26 +230,72 @@ impl GlassRenderer {
     ) -> Result<(), GlassError> {
         if size != self.buffers.size {
             self.buffers = Buffers::new(renderer, size)?;
+            self.cache.invalidate();
         }
         Ok(())
     }
 
+    pub fn stats(&self) -> GlassStats {
+        GlassStats {
+            scene_generation: self.cache.scene.map(|scene| scene.generation),
+            ..self.stats
+        }
+    }
+
     /// Capture the real client scene, blur it, then present glass and shell UI.
     /// Both element slices use Smithay front-to-back ordering. `scene` includes
-    /// normal windows and bottom/background layers, `foreground` only top and
-    /// overlay layers. The caller can recover from any error by clearing and
+    /// normal windows, compositor chrome and bottom/background layers;
+    /// `foreground` includes only top and overlay layers. Use an aggregate
+    /// render-element enum to interleave client surfaces and chrome. The caller
+    /// can recover from any error by clearing and
     /// drawing its ordinary scene to `target` again.
     ///
-    /// This first implementation redraws the full scene for each scheduled
-    /// frame. It reuses allocations but does not claim cached damage/idle reuse.
+    /// Advance `scene_generation` whenever a scene surface commits, its stacking
+    /// or placement changes, or an animation changes the scene. Foreground and
+    /// panel-only changes can reuse the generation: their final composition
+    /// does not require recapturing or blurring the scene. Output size, scale,
+    /// clear color and blur settings are checked independently.
     #[allow(clippy::too_many_arguments)]
-    pub fn render_scene(
+    pub fn render_scene<E: RenderElement<GlesRenderer>>(
         &mut self,
         renderer: &mut GlesRenderer,
         target: &mut GlesTarget<'_>,
         size: Size<i32, Physical>,
         scale: f64,
-        scene: &[WaylandSurfaceRenderElement<GlesRenderer>],
+        scene_generation: u64,
+        scene: &[E],
+        foreground: &[WaylandSurfaceRenderElement<GlesRenderer>],
+        panels: &[GlassPanel],
+        blur_material: &LiquidGlassMaterial,
+        clear: Color32F,
+    ) -> Result<(), GlassError> {
+        let result = self.render_scene_inner(
+            renderer,
+            target,
+            size,
+            scale,
+            scene_generation,
+            scene,
+            foreground,
+            panels,
+            blur_material,
+            clear,
+        );
+        if result.is_err() {
+            self.cache.invalidate();
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_scene_inner<E: RenderElement<GlesRenderer>>(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        target: &mut GlesTarget<'_>,
+        size: Size<i32, Physical>,
+        scale: f64,
+        scene_generation: u64,
+        scene: &[E],
         foreground: &[WaylandSurfaceRenderElement<GlesRenderer>],
         panels: &[GlassPanel],
         blur_material: &LiquidGlassMaterial,
@@ -194,36 +319,50 @@ impl GlassRenderer {
             .validate(size.w.min(size.h) as f32)
             .map_err(RenderError::from)?;
         let damage = Rectangle::from_size(size);
-        {
+        let scene_key = SceneKey::new(scene_generation, size, scale, clear);
+        if self.cache.capture_needed(scene_key) {
             let mut capture_target = renderer.bind(&mut self.buffers.scene)?;
             // Normal stores top-left at UV (0,0) in an offscreen GL texture.
             let mut frame = renderer.render(&mut capture_target, size, Transform::Normal)?;
             frame.clear(clear, &[damage])?;
             draw_render_elements(&mut frame, scale, scene, &[damage])?;
             let _sync = frame.finish()?;
+            self.stats.scene_captures = self.stats.scene_captures.saturating_add(1);
+            self.cache.captured(scene_key);
         }
         let passes = blur_material.kawase_blur_passes as usize;
-        let mut source = self.buffers.scene.clone();
-        for destination in self.buffers.down.iter_mut().take(passes) {
-            blur(
-                renderer,
-                &source,
-                destination,
-                &self.down_program,
-                blur_material.kawase_offset,
-            )?;
-            source = destination.clone();
+        let blur_key = BlurKey::new(scene_key, blur_material);
+        if !panels.is_empty() && self.cache.blur_needed(blur_key) {
+            let mut source = self.buffers.scene.clone();
+            for destination in self.buffers.down.iter_mut().take(passes) {
+                blur(
+                    renderer,
+                    &source,
+                    destination,
+                    &self.down_program,
+                    blur_material.kawase_offset,
+                )?;
+                self.stats.blur_passes = self.stats.blur_passes.saturating_add(1);
+                source = destination.clone();
+            }
+            for destination in self.buffers.up.iter_mut().take(passes).rev() {
+                blur(
+                    renderer,
+                    &source,
+                    destination,
+                    &self.up_program,
+                    blur_material.kawase_offset,
+                )?;
+                self.stats.blur_passes = self.stats.blur_passes.saturating_add(1);
+                source = destination.clone();
+            }
+            self.cache.blurred = Some(blur_key);
         }
-        for destination in self.buffers.up.iter_mut().take(passes).rev() {
-            blur(
-                renderer,
-                &source,
-                destination,
-                &self.up_program,
-                blur_material.kawase_offset,
-            )?;
-            source = destination.clone();
-        }
+        let source = if passes > 0 && !panels.is_empty() {
+            &self.buffers.up[0]
+        } else {
+            &self.buffers.scene
+        };
         // winit presentation uses Flipped180, matching its surface orientation.
         let mut frame = renderer.render(target, size, Transform::Flipped180)?;
         frame.clear(clear, &[damage])?;
@@ -240,7 +379,7 @@ impl GlassRenderer {
             ];
             // Draw the full-output backdrop so texture coordinates remain
             // output-relative. The shader clips to the panel and its shadow.
-            texture(&mut frame, &source, size, Some(&self.glass), &values)?;
+            texture(&mut frame, source, size, Some(&self.glass), &values)?;
         }
         draw_render_elements(&mut frame, scale, foreground, &[damage])?;
         let _sync = frame.finish()?;
@@ -293,4 +432,115 @@ fn texture(
         program,
         values,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scene(generation: u64) -> SceneKey {
+        SceneKey::new(generation, (1920, 1080).into(), 1.0, Color32F::BLACK)
+    }
+
+    #[test]
+    fn retained_scene_and_blur_skip_unchanged_backdrops() {
+        let scene = scene(7);
+        let blur = BlurKey::new(scene, &LiquidGlassMaterial::macos_dock_default());
+        let mut cache = BackdropCache::default();
+        assert!(cache.capture_needed(scene));
+        assert!(cache.blur_needed(blur));
+
+        cache.captured(scene);
+        assert!(!cache.capture_needed(scene));
+        assert!(cache.blur_needed(blur));
+        cache.blurred = Some(blur);
+        assert!(!cache.capture_needed(scene));
+        assert!(!cache.blur_needed(blur));
+
+        let next = super::SceneKey {
+            generation: 8,
+            ..scene
+        };
+        assert!(cache.capture_needed(next));
+        cache.captured(next);
+        assert!(!cache.capture_needed(next));
+        assert!(cache.blur_needed(BlurKey {
+            scene: next,
+            ..blur
+        }));
+    }
+
+    #[test]
+    fn output_dimensions_scale_and_every_clear_channel_invalidate_capture() {
+        let original = scene(7);
+        let mut cache = BackdropCache::default();
+        cache.captured(original);
+        let mut changed = vec![
+            SceneKey::new(7, (1919, 1080).into(), 1.0, Color32F::BLACK),
+            SceneKey::new(7, (1920, 1079).into(), 1.0, Color32F::BLACK),
+            SceneKey::new(7, (1920, 1080).into(), 1.25, Color32F::BLACK),
+        ];
+        for component in 0..4 {
+            let mut clear = Color32F::BLACK.components();
+            clear[component] = 0.5;
+            changed.push(SceneKey::new(7, (1920, 1080).into(), 1.0, clear.into()));
+        }
+        for key in changed {
+            assert!(cache.capture_needed(key), "stale scene reused for {key:?}");
+        }
+        assert!(!cache.capture_needed(original));
+    }
+
+    #[test]
+    fn blur_changes_reuse_capture_and_panel_optics_reuse_blur() {
+        let scene = scene(7);
+        let material = LiquidGlassMaterial::macos_dock_default();
+        let blur = BlurKey::new(scene, &material);
+        let mut cache = BackdropCache::default();
+        cache.captured(scene);
+        cache.blurred = Some(blur);
+
+        let panel_only = LiquidGlassMaterial {
+            ior: 1.33,
+            chromatic_dispersion: 0.01,
+            corner_radius: 20.0,
+            bevel_width: 10.0,
+            specular_intensity: 0.5,
+            tint_rgba: [0.1, 0.2, 0.3, 0.6],
+            ..material
+        };
+        assert!(!cache.blur_needed(BlurKey::new(scene, &panel_only)));
+
+        for changed in [
+            LiquidGlassMaterial {
+                kawase_blur_passes: 0,
+                ..material
+            },
+            LiquidGlassMaterial {
+                kawase_blur_passes: 6,
+                ..material
+            },
+            LiquidGlassMaterial {
+                kawase_offset: 2.0,
+                ..material
+            },
+        ] {
+            assert!(cache.blur_needed(BlurKey::new(scene, &changed)));
+            assert!(!cache.capture_needed(scene));
+        }
+    }
+
+    #[test]
+    fn invalidation_discards_both_partially_written_textures() {
+        let scene = scene(7);
+        let blur = BlurKey::new(scene, &LiquidGlassMaterial::macos_dock_default());
+        let mut cache = BackdropCache::default();
+        cache.captured(scene);
+        cache.blurred = Some(blur);
+
+        cache.invalidate();
+        assert_eq!(cache.scene, None);
+        assert!(cache.capture_needed(scene));
+        assert!(cache.blur_needed(blur));
+    }
 }

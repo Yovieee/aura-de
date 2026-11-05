@@ -11,22 +11,31 @@ use std::{
 
 use smithay::reexports::rustix::event::{PollFd, PollFlags, Timespec, poll};
 use wayland_client::{
-    Connection, Dispatch, QueueHandle, delegate_noop,
+    Connection, Dispatch, QueueHandle, WEnum, delegate_noop,
     protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool,
+        wl_surface,
     },
+};
+use wayland_protocols::xdg::decoration::zv1::client::{
+    zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
 };
 use wayland_protocols::xdg::shell::client::{
     xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
 };
+type DecorationMode = zxdg_toplevel_decoration_v1::Mode;
 
 #[derive(Debug)]
 struct Options {
     frames: u32,
     title: String,
     stay: bool,
+    idle_on_ready: bool,
     exercise_lifecycle: bool,
     exercise_popup: bool,
+    exercise_fullscreen: bool,
+    start_fullscreen: bool,
+    decoration_mode: Option<DecorationMode>,
 }
 
 impl Options {
@@ -35,8 +44,12 @@ impl Options {
             frames: 2,
             title: "Aura SHM smoke client".into(),
             stay: false,
+            idle_on_ready: false,
             exercise_lifecycle: false,
             exercise_popup: false,
+            exercise_fullscreen: false,
+            start_fullscreen: false,
+            decoration_mode: None,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -46,11 +59,24 @@ impl Options {
                 }
                 "--title" => options.title = args.next().ok_or("--title requires a value")?,
                 "--stay" => options.stay = true,
+                "--idle-on-ready" => {
+                    options.idle_on_ready = true;
+                    options.stay = true;
+                }
                 "--exercise-lifecycle" => options.exercise_lifecycle = true,
                 "--exercise-popup" => options.exercise_popup = true,
+                "--exercise-fullscreen" => options.exercise_fullscreen = true,
+                "--start-fullscreen" => options.start_fullscreen = true,
+                "--decoration-mode" => {
+                    options.decoration_mode = Some(match args.next().as_deref() {
+                        Some("server") => DecorationMode::ServerSide,
+                        Some("client") => DecorationMode::ClientSide,
+                        _ => return Err("--decoration-mode requires server or client".into()),
+                    });
+                }
                 "--help" | "-h" => {
                     println!(
-                        "smoke_client [--frames N (>=2)] [--title TITLE] [--stay] [--exercise-lifecycle] [--exercise-popup]"
+                        "smoke_client [--frames N (>=2)] [--title TITLE] [--stay] [--idle-on-ready] [--exercise-lifecycle] [--exercise-popup] [--exercise-fullscreen | --start-fullscreen] [--decoration-mode server|client]"
                     );
                     std::process::exit(0);
                 }
@@ -61,6 +87,11 @@ impl Options {
         }
         if options.frames < 2 {
             return Err("--frames must be at least 2 to verify repeated presentation".into());
+        }
+        if options.start_fullscreen && options.exercise_fullscreen {
+            return Err(
+                "--start-fullscreen and --exercise-fullscreen are mutually exclusive".into(),
+            );
         }
         Ok(options)
     }
@@ -84,6 +115,37 @@ enum Callback {
     PopupFrame(u32),
     FirstMaximizeSync,
     SecondMaximizeSync,
+    FullscreenSync(FullscreenPhase),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullscreenPhase {
+    NotStarted,
+    EnterSync,
+    EnterFrame,
+    RepeatEnterSync,
+    RepeatEnterFrame,
+    LeaveSync,
+    LeaveFrame,
+    RepeatLeaveSync,
+    RepeatLeaveFrame,
+    PersistentSync,
+    PersistentFrame,
+    PersistentComplete,
+    Complete,
+}
+
+impl FullscreenPhase {
+    fn waiting_for_sync(self) -> bool {
+        matches!(
+            self,
+            Self::EnterSync
+                | Self::RepeatEnterSync
+                | Self::LeaveSync
+                | Self::RepeatLeaveSync
+                | Self::PersistentSync
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,6 +171,12 @@ struct State {
     compositor: Option<wl_compositor::WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
+    output: Option<wl_output::WlOutput>,
+    output_size: Option<(i32, i32)>,
+    output_scale: i32,
+    decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
+    decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
+    decoration_mode: Option<DecorationMode>,
     surface: Option<wl_surface::WlSurface>,
     xdg_surface: Option<xdg_surface::XdgSurface>,
     toplevel: Option<xdg_toplevel::XdgToplevel>,
@@ -122,6 +190,10 @@ struct State {
     callbacks: u32,
     lifecycle: Lifecycle,
     maximized: bool,
+    fullscreen: bool,
+    fullscreen_phase: FullscreenPhase,
+    fullscreen_restore_size: (i32, i32),
+    fullscreen_restore_maximized: bool,
     remap_callbacks: u32,
     popup: Option<Popup>,
     closed: bool,
@@ -135,6 +207,12 @@ impl State {
             compositor: None,
             shm: None,
             wm_base: None,
+            output: None,
+            output_size: None,
+            output_scale: 1,
+            decoration_manager: None,
+            decoration: None,
+            decoration_mode: None,
             surface: None,
             xdg_surface: None,
             toplevel: None,
@@ -148,6 +226,10 @@ impl State {
             callbacks: 0,
             lifecycle: Lifecycle::InitialFrames,
             maximized: false,
+            fullscreen: false,
+            fullscreen_phase: FullscreenPhase::NotStarted,
+            fullscreen_restore_size: (0, 0),
+            fullscreen_restore_maximized: false,
             remap_callbacks: 0,
             popup: None,
             closed: false,
@@ -157,6 +239,9 @@ impl State {
 
     fn initialize(&mut self, qh: &QueueHandle<Self>) {
         if self.surface.is_some() {
+            return;
+        }
+        if self.options.decoration_mode.is_some() && self.decoration_manager.is_none() {
             return;
         }
         let (Some(compositor), Some(wm_base), Some(_)) =
@@ -169,6 +254,20 @@ impl State {
         let toplevel = xdg_surface.get_toplevel(qh, ());
         toplevel.set_app_id("org.aura.SmokeClient".into());
         toplevel.set_title(self.options.title.clone());
+        if self.options.start_fullscreen {
+            // Exercise the protocol request before the initial bufferless commit.
+            // Readiness later verifies that this request survived mapping.
+            toplevel.set_fullscreen(None);
+        }
+        if let Some(mode) = self.options.decoration_mode {
+            let decoration = self
+                .decoration_manager
+                .as_ref()
+                .unwrap()
+                .get_toplevel_decoration(&toplevel, qh, ());
+            decoration.set_mode(mode);
+            self.decoration = Some(decoration);
+        }
         // The initial role commit must not attach a buffer until configure is acknowledged.
         surface.commit();
         self.surface = Some(surface);
@@ -241,7 +340,7 @@ impl State {
         Ok(())
     }
 
-    fn main_complete(&self) -> bool {
+    fn lifecycle_complete(&self) -> bool {
         if self.options.exercise_lifecycle {
             self.lifecycle == Lifecycle::Complete
         } else {
@@ -249,8 +348,23 @@ impl State {
         }
     }
 
+    fn main_complete(&self) -> bool {
+        self.lifecycle_complete()
+            && (!self.options.exercise_fullscreen
+                || self.fullscreen_phase == FullscreenPhase::Complete)
+            && (!self.options.start_fullscreen
+                || (self.fullscreen_phase == FullscreenPhase::PersistentComplete
+                    && self.fullscreen))
+    }
+
+    fn animate_when_ready(&self) -> bool {
+        self.options.stay && !self.options.idle_on_ready
+    }
+
     fn complete(&self) -> bool {
         self.main_complete()
+            && (self.options.decoration_mode.is_none()
+                || self.decoration_mode == self.options.decoration_mode)
             && (!self.options.exercise_popup
                 || self
                     .popup
@@ -329,9 +443,90 @@ impl State {
     }
 
     fn after_frame(&mut self, connection: &Connection, qh: &QueueHandle<Self>) -> io::Result<()> {
+        if self.options.exercise_fullscreen || self.options.start_fullscreen {
+            match self.fullscreen_phase {
+                FullscreenPhase::PersistentFrame => {
+                    self.fullscreen_phase = FullscreenPhase::PersistentComplete;
+                    eprintln!("fullscreen: output-covering buffer presented; remaining fullscreen");
+                    self.maybe_start_popup(qh);
+                    if self.animate_when_ready() {
+                        self.submit(qh)?;
+                    }
+                    return Ok(());
+                }
+                FullscreenPhase::EnterFrame => {
+                    self.fullscreen_phase = FullscreenPhase::RepeatEnterSync;
+                    self.toplevel.as_ref().unwrap().set_fullscreen(None);
+                    connection
+                        .display()
+                        .sync(qh, Callback::FullscreenSync(self.fullscreen_phase));
+                    return Ok(());
+                }
+                FullscreenPhase::RepeatEnterFrame => {
+                    self.fullscreen_phase = FullscreenPhase::LeaveSync;
+                    self.toplevel.as_ref().unwrap().unset_fullscreen();
+                    connection
+                        .display()
+                        .sync(qh, Callback::FullscreenSync(self.fullscreen_phase));
+                    return Ok(());
+                }
+                FullscreenPhase::LeaveFrame => {
+                    self.fullscreen_phase = FullscreenPhase::RepeatLeaveSync;
+                    self.toplevel.as_ref().unwrap().unset_fullscreen();
+                    connection
+                        .display()
+                        .sync(qh, Callback::FullscreenSync(self.fullscreen_phase));
+                    return Ok(());
+                }
+                FullscreenPhase::RepeatLeaveFrame => {
+                    self.fullscreen_phase = FullscreenPhase::Complete;
+                    eprintln!(
+                        "fullscreen: repeated enter/leave preserved output coverage and restore geometry"
+                    );
+                    self.maybe_start_popup(qh);
+                    if self.animate_when_ready() {
+                        self.submit(qh)?;
+                    }
+                    return Ok(());
+                }
+                phase if phase.waiting_for_sync() => {
+                    return Err(io::Error::other(
+                        "frame arrived during a fullscreen barrier",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        self.after_lifecycle_frame(connection, qh)?;
+        if (self.options.exercise_fullscreen || self.options.start_fullscreen)
+            && self.fullscreen_phase == FullscreenPhase::NotStarted
+            && self.lifecycle_complete()
+        {
+            self.fullscreen_restore_size = self.size;
+            self.fullscreen_restore_maximized = self.maximized;
+            self.fullscreen_phase = if self.options.start_fullscreen {
+                FullscreenPhase::PersistentSync
+            } else {
+                FullscreenPhase::EnterSync
+            };
+            if !self.options.start_fullscreen {
+                self.toplevel.as_ref().unwrap().set_fullscreen(None);
+            }
+            connection
+                .display()
+                .sync(qh, Callback::FullscreenSync(self.fullscreen_phase));
+        }
+        Ok(())
+    }
+
+    fn after_lifecycle_frame(
+        &mut self,
+        connection: &Connection,
+        qh: &QueueHandle<Self>,
+    ) -> io::Result<()> {
         if !self.options.exercise_lifecycle {
             self.maybe_start_popup(qh);
-            if self.options.stay || !self.main_complete() {
+            if !self.lifecycle_complete() || (self.animate_when_ready() && self.main_complete()) {
                 self.submit(qh)?;
             }
             return Ok(());
@@ -363,7 +558,7 @@ impl State {
                 if self.remap_callbacks >= self.options.frames {
                     self.lifecycle = Lifecycle::Complete;
                     self.maybe_start_popup(qh);
-                    if self.options.stay {
+                    if self.animate_when_ready() && self.main_complete() {
                         self.submit(qh)?;
                     }
                 } else {
@@ -372,7 +567,7 @@ impl State {
             }
             Lifecycle::Complete => {
                 self.maybe_start_popup(qh);
-                if self.options.stay {
+                if self.animate_when_ready() && self.main_complete() {
                     self.submit(qh)?;
                 }
             }
@@ -380,6 +575,61 @@ impl State {
             _ => return Err(io::Error::other("frame arrived during a lifecycle barrier")),
         }
         Ok(())
+    }
+
+    fn fullscreen_sync(
+        &mut self,
+        phase: FullscreenPhase,
+        qh: &QueueHandle<Self>,
+    ) -> io::Result<()> {
+        if self.fullscreen_phase != phase {
+            return Err(io::Error::other(
+                "unexpected fullscreen synchronization callback",
+            ));
+        }
+        self.fullscreen_phase = match phase {
+            FullscreenPhase::EnterSync
+            | FullscreenPhase::RepeatEnterSync
+            | FullscreenPhase::PersistentSync => {
+                let output = self
+                    .output_size
+                    .ok_or_else(|| io::Error::other("wl_output mode unavailable"))?;
+                let logical_output = (output.0 / self.output_scale, output.1 / self.output_scale);
+                if !self.fullscreen || self.size != logical_output {
+                    return Err(io::Error::other(format!(
+                        "fullscreen request must cover output: fullscreen={} size={:?} output={logical_output:?}",
+                        self.fullscreen, self.size,
+                    )));
+                }
+                match phase {
+                    FullscreenPhase::EnterSync => FullscreenPhase::EnterFrame,
+                    FullscreenPhase::PersistentSync => FullscreenPhase::PersistentFrame,
+                    _ => FullscreenPhase::RepeatEnterFrame,
+                }
+            }
+            FullscreenPhase::LeaveSync | FullscreenPhase::RepeatLeaveSync => {
+                if self.fullscreen
+                    || self.size != self.fullscreen_restore_size
+                    || self.maximized != self.fullscreen_restore_maximized
+                {
+                    return Err(io::Error::other(format!(
+                        "leaving fullscreen did not restore previous state: fullscreen={} size={:?} expected={:?} maximized={} expected={}",
+                        self.fullscreen,
+                        self.size,
+                        self.fullscreen_restore_size,
+                        self.maximized,
+                        self.fullscreen_restore_maximized,
+                    )));
+                }
+                if phase == FullscreenPhase::LeaveSync {
+                    FullscreenPhase::LeaveFrame
+                } else {
+                    FullscreenPhase::RepeatLeaveFrame
+                }
+            }
+            _ => return Err(io::Error::other("invalid fullscreen synchronization phase")),
+        };
+        self.submit(qh)
     }
 
     fn cleanup(&mut self) {
@@ -391,6 +641,12 @@ impl State {
             if let Some(buffer) = popup.buffer {
                 buffer.destroy();
             }
+        }
+        if let Some(decoration) = self.decoration.take() {
+            decoration.destroy();
+        }
+        if let Some(manager) = self.decoration_manager.take() {
+            manager.destroy();
         }
         if let Some(toplevel) = self.toplevel.take() {
             toplevel.destroy();
@@ -438,6 +694,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 "xdg_wm_base" if state.wm_base.is_none() => {
                     state.wm_base = Some(registry.bind(name, 1, qh, ()));
                 }
+                "wl_output" if state.output.is_none() => {
+                    state.output = Some(registry.bind(name, version.min(2), qh, ()));
+                }
+                "zxdg_decoration_manager_v1" if state.decoration_manager.is_none() => {
+                    state.decoration_manager = Some(registry.bind(name, 1, qh, ()));
+                }
                 _ => {}
             }
             state.initialize(qh);
@@ -456,6 +718,48 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
     ) {
         if let xdg_wm_base::Event::Ping { serial } = event {
             base.pong(serial);
+        }
+    }
+}
+
+impl Dispatch<wl_output::WlOutput, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_output::WlOutput,
+        event: wl_output::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_output::Event::Mode {
+                flags: WEnum::Value(flags),
+                width,
+                height,
+                ..
+            } if flags.contains(wl_output::Mode::Current) => {
+                state.output_size = Some((width, height))
+            }
+            wl_output::Event::Scale { factor } if factor > 0 => state.output_scale = factor,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+        event: zxdg_toplevel_decoration_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zxdg_toplevel_decoration_v1::Event::Configure {
+            mode: WEnum::Value(mode),
+        } = event
+        {
+            state.decoration_mode = Some(mode);
         }
     }
 }
@@ -481,6 +785,9 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceRole> for State {
                 return;
             }
             state.configured = true;
+            if state.fullscreen_phase.waiting_for_sync() {
+                return;
+            }
             match state.lifecycle {
                 Lifecycle::FirstMaximizeSync | Lifecycle::SecondMaximizeSync => return,
                 Lifecycle::RemapConfigure => {
@@ -514,6 +821,9 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
             } => {
                 state.maximized = states.as_chunks::<4>().0.iter().any(|bytes| {
                     u32::from_ne_bytes(*bytes) == xdg_toplevel::State::Maximized as u32
+                });
+                state.fullscreen = states.as_chunks::<4>().0.iter().any(|bytes| {
+                    u32::from_ne_bytes(*bytes) == xdg_toplevel::State::Fullscreen as u32
                 });
 
                 if width > 0 {
@@ -591,6 +901,7 @@ impl Dispatch<wl_callback::WlCallback, Callback> for State {
                         state.submit(qh)
                     }
                 }
+                Callback::FullscreenSync(phase) => state.fullscreen_sync(phase, qh),
             };
             if let Err(error) = result {
                 state.error = Some(error.to_string());
@@ -655,6 +966,7 @@ delegate_noop!(State: ignore wl_surface::WlSurface);
 delegate_noop!(State: ignore wl_shm::WlShm);
 delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(State: ignore xdg_positioner::XdgPositioner);
+delegate_noop!(State: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
 
 fn run(connection: &Connection, state: &mut State) -> Result<(), Box<dyn Error>> {
     let mut queue = connection.new_event_queue::<State>();
@@ -669,7 +981,7 @@ fn run(connection: &Connection, state: &mut State) -> Result<(), Box<dyn Error>>
         if state.complete() {
             if !reported {
                 println!(
-                    "SMOKE_CLIENT_OK frames={} commits={} lifecycle={} popup_frames={}",
+                    "SMOKE_CLIENT_OK frames={} commits={} lifecycle={} popup_frames={} fullscreen={} decoration={}",
                     state.callbacks,
                     state.commits,
                     if state.options.exercise_lifecycle {
@@ -677,7 +989,19 @@ fn run(connection: &Connection, state: &mut State) -> Result<(), Box<dyn Error>>
                     } else {
                         "disabled"
                     },
-                    state.popup.as_ref().map_or(0, |popup| popup.callbacks)
+                    state.popup.as_ref().map_or(0, |popup| popup.callbacks),
+                    if state.options.exercise_fullscreen {
+                        "passed"
+                    } else if state.options.start_fullscreen {
+                        "active"
+                    } else {
+                        "disabled"
+                    },
+                    match state.decoration_mode {
+                        Some(DecorationMode::ServerSide) => "server",
+                        Some(DecorationMode::ClientSide) => "client",
+                        _ => "none",
+                    },
                 );
                 reported = true;
             }

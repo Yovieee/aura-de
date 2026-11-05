@@ -1,6 +1,8 @@
 # Liquid Glass Shader & Optical Pipeline Guide
 
-The optical layers below are design targets. Shader parsing/validation, successful GPU render/read-back and live compositor backdrop integration are separate checks; consult [implementation status](implementation-status.md) for observed results. A shell client has no automatic access to other Wayland clients' pixels. Backdrop capture and the client/compositor contract must be implemented in the compositor before live transparency can be claimed.
+The optical layers below describe the design. Shader parsing/validation, successful GPU render/read-back and live compositor backdrop integration are separate checks; consult [implementation status](implementation-status.md) for observed results. A shell client has no automatic access to other Wayland clients' pixels; the nested implementation captures the scene and renders authorized Aura glass surfaces in the compositor.
+
+The nested implementation retains compositor-owned scene and blur textures. Scene generation, output dimensions/scale and clear color invalidate capture; material blur changes invalidate blur while foreground-only shell changes reuse it. Unchanged outputs skip GPU rendering, capture and blur work. Dirty outputs are still redrawn as full frames; this is not a complete regional-damage renderer. Active ScreenCast deliberately requests periodic frames and has separate asynchronous PBO readback. The current compositor format is SDR RGBA8; no HDR or target-hardware performance claim follows from the software-renderer checks.
 
 ## Physical Inspiration & Optical Layers
 

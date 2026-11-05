@@ -13,7 +13,7 @@ for argument in "$@"; do
         -h|--help)
             echo "Usage: $0 [--native] [--testing] [--dry-run]"
             echo "Default: packages for nested Wayland/EGL development."
-            echo "--native: also install DRM/input/session/PipeWire development packages."
+            echo "--native: also install DRM/input/session development packages."
             echo "--testing: also install Xvfb, Mesa software renderers and Wayland/DBus tools."
             exit 0 ;;
         *) echo "Unknown argument: $argument" >&2; exit 2 ;;
@@ -23,12 +23,12 @@ done
 # winit loads the X11 keyboard library at runtime; libxkbcommon-dev does not provide it.
 packages=(build-essential pkg-config python3 curl ca-certificates
           libwayland-dev libegl1-mesa-dev libgles2-mesa-dev
-          libxkbcommon-dev libxkbcommon-x11-0)
+          libxkbcommon-dev libxkbcommon-x11-0 libpipewire-0.3-dev libclang-dev clang)
 if "$native"; then
-    packages+=(libdrm-dev libgbm-dev libinput-dev libseat-dev libudev-dev libpipewire-0.3-dev)
+    packages+=(libdrm-dev libgbm-dev libinput-dev libseat-dev libudev-dev)
 fi
 if "$testing"; then
-    packages+=(xvfb xauth mesa-vulkan-drivers libgl1-mesa-dri dbus-x11 wayland-utils libxtst6)
+    packages+=(xvfb xauth mesa-vulkan-drivers libgl1-mesa-dri dbus-x11 libglib2.0-bin wayland-utils libxtst6 pipewire-bin libpipewire-0.3-modules libspa-0.2-modules)
 fi
 if "$dry_run"; then
     printf '%s\n' "${packages[@]}"

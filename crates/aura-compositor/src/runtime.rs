@@ -1,11 +1,15 @@
 //! Real Wayland protocols, input routing and nested EGL presentation.
 use crate::{
     Config,
+    capture::{CaptureConfig, CaptureProducer},
+    decorations::{self, DecorationHit},
     glass::{GlassPanel, GlassRenderer},
+    scene::SceneElement,
 };
 use aura_compositor::state::AuraCompositorState;
 use aura_core::{GlassQualityPreset, LayoutMode, Rect, TrafficLightAction, WindowStateFlags};
 use smithay::wayland::shell::xdg::SurfaceCachedState as XdgSurfaceCachedState;
+use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::{
     backend::{
         input::{
@@ -15,16 +19,20 @@ use smithay::{
         renderer::{
             Color32F, Frame, Renderer,
             element::{
-                Kind,
+                Id, Kind,
+                solid::SolidColorRenderElement,
                 surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
             },
             gles::GlesRenderer,
-            utils::{draw_render_elements, on_commit_buffer_handler, with_renderer_surface_state},
+            utils::{
+                CommitCounter, draw_render_elements, on_commit_buffer_handler,
+                with_renderer_surface_state,
+            },
         },
         winit::{self, WinitEvent},
     },
     delegate_compositor, delegate_data_device, delegate_layer_shell, delegate_output,
-    delegate_seat, delegate_shm, delegate_xdg_shell,
+    delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
         LayerSurface as DesktopLayer, PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab,
         WindowSurfaceType, find_popup_root_surface, layer_map_for_output,
@@ -67,6 +75,7 @@ use smithay::{
 use std::{
     collections::HashSet,
     error::Error,
+    hash::{Hash, Hasher},
     io::{BufRead, BufReader, Read, Write},
     os::unix::{fs::PermissionsExt, io::OwnedFd, net::UnixListener},
     path::PathBuf,
@@ -77,6 +86,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 use wayland_server::{
     Client, Display, ListeningSocket, Resource,
@@ -88,6 +98,7 @@ struct Toplevel {
     id: u64,
     surface: ToplevelSurface,
     mapped: bool,
+    requested_fullscreen: bool,
 }
 struct Drag {
     id: u64,
@@ -104,6 +115,7 @@ struct App {
     dh: wayland_server::DisplayHandle,
     compositor: CompositorState,
     xdg: XdgShellState,
+    _decorations: XdgDecorationState,
     shm: ShmState,
     seats: SeatState<Self>,
     data: DataDeviceState,
@@ -120,6 +132,14 @@ struct App {
     drag: Option<Drag>,
     scale: i32,
     glass_ready: bool,
+    frame_dirty: bool,
+    scene_generation: u64,
+    rendered_frames: u64,
+    scene_captures: u64,
+    blur_passes: u64,
+    capture_available: bool,
+    capture_subscribers: usize,
+    capture_stop_requested: bool,
 }
 
 impl App {
@@ -132,6 +152,12 @@ impl App {
     fn exclusive_layer(&self) -> Option<WlSurface> {
         let map = layer_map_for_output(&self.output);
         for layer in [Layer::Overlay, Layer::Top] {
+            if layer == Layer::Top
+                && self.fullscreen_window().is_some()
+                && self.capture_subscribers == 0
+            {
+                continue;
+            }
             if let Some(surface) = map.layers_on(layer).rev().find(|l| {
                 with_renderer_surface_state(l.wl_surface(), |s| s.buffer().is_some())
                     .unwrap_or(false)
@@ -177,17 +203,119 @@ impl App {
         }
         None
     }
+    fn fullscreen_window(&self) -> Option<u64> {
+        self.model
+            .workspace
+            .windows()
+            .iter()
+            .find(|w| {
+                w.flags
+                    .contains(WindowStateFlags::FOCUSED | WindowStateFlags::FULLSCREEN)
+                    && !w.flags.contains(WindowStateFlags::MINIMIZED)
+            })
+            .map(|w| w.id)
+    }
+    fn server_decorated(&self, top: &Toplevel, flags: WindowStateFlags) -> bool {
+        decorations::is_server_side(top.surface.current_state().decoration_mode, flags)
+    }
+    fn visual_rect(&self, node: &aura_core::WindowNode) -> Rect {
+        self.model
+            .blur_regions
+            .iter()
+            .find(|r| r.window_id == node.id)
+            .map(|r| r.rect)
+            .unwrap_or(node.computed_rect)
+    }
+    fn scene_key(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for top in &self.toplevels {
+            top.id.hash(&mut h);
+            top.mapped.hash(&mut h);
+            top.surface
+                .current_state()
+                .decoration_mode
+                .map(|m| m as u32)
+                .hash(&mut h);
+            if let Some(node) = self
+                .model
+                .workspace
+                .windows()
+                .iter()
+                .find(|w| w.id == top.id)
+            {
+                node.flags.bits().hash(&mut h);
+                let r = self.visual_rect(node);
+                for v in [r.x, r.y, r.width, r.height] {
+                    v.to_bits().hash(&mut h);
+                }
+            }
+        }
+        let map = layer_map_for_output(&self.output);
+        for layer in [Layer::Background, Layer::Bottom] {
+            for surface in map.layers_on(layer) {
+                if !with_renderer_surface_state(surface.wl_surface(), |s| s.buffer().is_some())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                surface.wl_surface().id().hash(&mut h);
+                (layer as u32).hash(&mut h);
+                if let Some(geo) = map.layer_geometry(surface) {
+                    geo.loc.x.hash(&mut h);
+                    geo.loc.y.hash(&mut h);
+                    geo.size.w.hash(&mut h);
+                    geo.size.h.hash(&mut h);
+                }
+            }
+        }
+        h.finish()
+    }
+    fn request_fullscreen(&mut self, surface: &ToplevelSurface, enabled: bool) {
+        let Some(top) = self
+            .toplevels
+            .iter_mut()
+            .find(|top| top.surface == *surface)
+        else {
+            return;
+        };
+        top.requested_fullscreen = enabled;
+        let id = top.id;
+        if !top.mapped {
+            let output = self.model.workspace.output_rect;
+            surface.with_pending_state(|state| {
+                if enabled {
+                    state.states.set(xdg_toplevel::State::Fullscreen);
+                    state.size = Some((output.width as i32, output.height as i32).into());
+                } else {
+                    state.states.unset(xdg_toplevel::State::Fullscreen);
+                    state.size = Some((640, 480).into());
+                }
+            });
+            if surface.is_initial_configure_sent() {
+                surface.send_pending_configure();
+            }
+            return;
+        }
+        self.model.workspace.set_fullscreen(id, enabled);
+        if enabled {
+            self.focus(id);
+        }
+        self.frame_dirty = true;
+        self.configure_windows();
+    }
     fn configure_windows(&mut self) {
         for node in self.model.workspace.windows() {
             if let Some(top) = self.toplevels.iter().find(|t| t.id == node.id) {
+                let desired_mode = top
+                    .surface
+                    .with_pending_state(|state| state.decoration_mode);
+                let content = decorations::content_rect(
+                    node.computed_rect,
+                    decorations::is_server_side(desired_mode, node.flags),
+                );
                 top.surface.with_pending_state(|state| {
-                    state.size = Some(
-                        (
-                            node.computed_rect.width.round() as i32,
-                            node.computed_rect.height.round() as i32,
-                        )
-                            .into(),
-                    );
+                    state.size =
+                        Some((content.width.round() as i32, content.height.round() as i32).into());
                     for (flag, value) in [
                         (WindowStateFlags::FOCUSED, xdg_toplevel::State::Activated),
                         (WindowStateFlags::MAXIMIZED, xdg_toplevel::State::Maximized),
@@ -271,6 +399,12 @@ impl App {
     fn surface_under(&self) -> Option<(WlSurface, Point<f64, Logical>)> {
         let map = layer_map_for_output(&self.output);
         for layer in [Layer::Overlay, Layer::Top] {
+            if layer == Layer::Top
+                && self.fullscreen_window().is_some()
+                && self.capture_subscribers == 0
+            {
+                continue;
+            }
             if let Some(surface) = map.layer_under(layer, self.pointer) {
                 let loc = map.layer_geometry(surface)?.loc.to_f64();
                 if let Some((surface, offset)) =
@@ -296,7 +430,9 @@ impl App {
                     .find(|r| r.window_id == node.id)
                     .map(|r| r.rect)
                     .unwrap_or(node.computed_rect);
-                let loc: Point<i32, Logical> = (rect.x as i32, rect.y as i32).into();
+                let content =
+                    decorations::content_rect(rect, self.server_decorated(top, node.flags));
+                let loc: Point<i32, Logical> = (content.x as i32, content.y as i32).into();
                 let geometry = with_states(top.surface.wl_surface(), |s| {
                     s.cached_state
                         .get::<XdgSurfaceCachedState>()
@@ -322,6 +458,48 @@ impl App {
                     WindowSurfaceType::ALL,
                 ) {
                     return Some((surface, offset.to_f64()));
+                }
+            }
+        }
+        None
+    }
+    fn chrome_under(&self) -> Option<(u64, Rect, DecorationHit)> {
+        // An overlay consumes input before any client chrome.
+        let map = layer_map_for_output(&self.output);
+        for layer in [Layer::Overlay, Layer::Top] {
+            if layer == Layer::Top
+                && self.fullscreen_window().is_some()
+                && self.capture_subscribers == 0
+            {
+                continue;
+            }
+            if map.layer_under(layer, self.pointer).is_some() {
+                return None;
+            }
+        }
+        drop(map);
+        for top in self.toplevels.iter().rev().filter(|t| t.mapped) {
+            if let Some(node) = self
+                .model
+                .workspace
+                .windows()
+                .iter()
+                .find(|w| w.id == top.id && !w.flags.contains(WindowStateFlags::MINIMIZED))
+            {
+                let r = self.visual_rect(node);
+                if self.server_decorated(top, node.flags)
+                    && let Some(hit) = decorations::hit_test(r, (self.pointer.x, self.pointer.y))
+                {
+                    return Some((node.id, r, hit));
+                }
+                // A higher client's content occludes lower chrome.
+                let content = decorations::content_rect(r, self.server_decorated(top, node.flags));
+                if self.pointer.x >= content.x as f64
+                    && self.pointer.x < (content.x + content.width) as f64
+                    && self.pointer.y >= content.y as f64
+                    && self.pointer.y < (content.y + content.height) as f64
+                {
+                    return None;
                 }
             }
         }
@@ -367,9 +545,10 @@ impl App {
                 "quality": if self.model.glass_material.kawase_blur_passes==0 {"reduced-transparency"} else if self.model.glass_material.chromatic_dispersion==0.0 {"balanced"} else {"ultra"},
                 "mapped_windows": self.toplevels.iter().filter(|t|t.mapped).count(),
                 "visible_windows": self.model.workspace.windows().iter().filter(|w|!w.flags.contains(WindowStateFlags::MINIMIZED)).count(),
-                "reserved_top": self.model.workspace.menu_bar_height, "reserved_bottom":self.model.workspace.dock_reserved_height, "layers": self.layers.layer_surfaces().count(), "mapped_layers":self.layers.layer_surfaces().filter(|l|with_renderer_surface_state(l.wl_surface(),|s|s.buffer().is_some()).unwrap_or(false)).count(), "glass_active":self.glass_ready
+                "reserved_top": self.model.workspace.menu_bar_height, "reserved_bottom":self.model.workspace.dock_reserved_height, "layers": self.layers.layer_surfaces().count(), "mapped_layers":self.layers.layer_surfaces().filter(|l|with_renderer_surface_state(l.wl_surface(),|s|s.buffer().is_some()).unwrap_or(false)).count(), "glass_active":self.glass_ready, "capture_available":self.capture_available,"capture_subscribers":self.capture_subscribers,
+                "rendered_frames":self.rendered_frames,"scene_captures":self.scene_captures,"blur_passes":self.blur_passes,"scene_generation":self.scene_generation
             }).to_string()),
-            ["windows"] => Ok(serde_json::Value::Array(self.model.workspace.windows().iter().map(|w| serde_json::json!({"id":w.id,"app_id":w.app_id,"title":w.title,"minimized":w.flags.contains(WindowStateFlags::MINIMIZED),"focused":w.flags.contains(WindowStateFlags::FOCUSED),"rect":{"x":w.computed_rect.x,"y":w.computed_rect.y,"width":w.computed_rect.width,"height":w.computed_rect.height}})).collect()).to_string()),
+            ["windows"] => Ok(serde_json::Value::Array(self.model.workspace.windows().iter().map(|w| serde_json::json!({"id":w.id,"app_id":w.app_id,"title":w.title,"minimized":w.flags.contains(WindowStateFlags::MINIMIZED),"focused":w.flags.contains(WindowStateFlags::FOCUSED),"fullscreen":w.flags.contains(WindowStateFlags::FULLSCREEN),"maximized":w.flags.contains(WindowStateFlags::MAXIMIZED),"rect":{"x":w.computed_rect.x,"y":w.computed_rect.y,"width":w.computed_rect.width,"height":w.computed_rect.height}})).collect()).to_string()),
             ["layout", mode] => { self.model.set_layout_mode(match *mode { "floating"=>LayoutMode::Floating,"stage-manager"=>LayoutMode::StageManager,"tiling"=>LayoutMode::DynamicTiling,_=>return Err("invalid layout".into()) }); self.configure_windows(); Ok("OK".into()) }
             ["quality", quality] => { self.model.glass_material = aura_core::LiquidGlassMaterial::from_preset(match *quality { "ultra"=>GlassQualityPreset::Ultra,"balanced"=>GlassQualityPreset::Balanced,"reduced-transparency"=>GlassQualityPreset::ReducedTransparency,_=>return Err("invalid quality".into()) }); Ok("OK".into()) }
             [command @ ("focus"|"restore"|"minimize"|"close"), id] => {
@@ -378,11 +557,14 @@ impl App {
                 match *command { "focus"=>self.focus(id), "restore"=>{self.model.workspace.restore_window(id);self.focus(id);}, "minimize"=>self.action(id,TrafficLightAction::MinimizeToDock),_=>self.action(id,TrafficLightAction::Close) }
                 Ok("OK".into())
             }
+            ["stop-screen-sharing"]=>{self.capture_stop_requested=true;Ok("OK".into())},
             ["quit"] => { self.model.should_exit=true; Ok("OK".into()) }
             _ => Err("unknown command".into()),
         }
     }
     fn resize(&mut self, size: smithay::utils::Size<i32, smithay::utils::Physical>) {
+        self.frame_dirty = true;
+        self.scene_generation = self.scene_generation.wrapping_add(1);
         let mode = Mode {
             size,
             refresh: 60_000,
@@ -440,8 +622,28 @@ impl CompositorHandler for App {
     fn client_compositor_state<'a>(&self, c: &'a Client) -> &'a CompositorClientState {
         &c.get_data::<ClientState>().unwrap().compositor
     }
+    fn destroyed(&mut self, _surface: &WlSurface) {
+        self.frame_dirty = true;
+        self.scene_generation = self.scene_generation.wrapping_add(1);
+    }
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+        self.frame_dirty = true;
+        let foreground = self.layers.layer_surfaces().any(|l| {
+            l.wl_surface() == surface
+                && with_states(surface, |s| {
+                    matches!(
+                        s.cached_state
+                            .get::<LayerSurfaceCachedState>()
+                            .current()
+                            .layer,
+                        Layer::Top | Layer::Overlay
+                    )
+                })
+        });
+        if !foreground {
+            self.scene_generation = self.scene_generation.wrapping_add(1);
+        }
         self.popups.commit(surface);
         let has_buffer =
             with_renderer_surface_state(surface, |s| s.buffer().is_some()).unwrap_or(false);
@@ -455,12 +657,19 @@ impl CompositorHandler for App {
             let was_mapped = top.mapped;
             top.mapped = has_buffer;
             let shell = top.surface.clone();
+            let requested_fullscreen = top.requested_fullscreen;
+            if was_mapped && !has_buffer {
+                top.requested_fullscreen = false;
+            }
             if has_buffer && !was_mapped {
                 let size = with_renderer_surface_state(surface, |s| s.buffer_size())
                     .flatten()
                     .unwrap_or_else(|| (640, 480).into());
                 self.model
                     .map_xdg_window(id, "", "", (size.w as f32, size.h as f32));
+                self.model
+                    .workspace
+                    .set_fullscreen(id, requested_fullscreen);
                 self.output.enter(surface);
                 self.metadata(&shell);
                 self.focus(id);
@@ -472,7 +681,16 @@ impl CompositorHandler for App {
                 self.sync_focus();
             }
             if !has_buffer && !shell.is_initial_configure_sent() {
-                shell.with_pending_state(|s| s.size = Some((640, 480).into()));
+                let output = self.model.workspace.output_rect;
+                shell.with_pending_state(|s| {
+                    if requested_fullscreen && !was_mapped {
+                        s.states.set(xdg_toplevel::State::Fullscreen);
+                        s.size = Some((output.width as i32, output.height as i32).into());
+                    } else {
+                        s.states.unset(xdg_toplevel::State::Fullscreen);
+                        s.size = Some((640, 480).into());
+                    }
+                });
                 shell.send_configure();
             }
         }
@@ -540,6 +758,7 @@ impl XdgShellHandler for App {
             id,
             surface,
             mapped: false,
+            requested_fullscreen: false,
         });
     }
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
@@ -607,6 +826,12 @@ impl XdgShellHandler for App {
             self.action(id, TrafficLightAction::MinimizeToDock);
         }
     }
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, _: Option<WlOutput>) {
+        self.request_fullscreen(&surface, true);
+    }
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        self.request_fullscreen(&surface, false);
+    }
     fn maximize_request(&mut self, surface: ToplevelSurface) {
         if let Some(id) = self.id(&surface)
             && self
@@ -640,6 +865,8 @@ impl XdgShellHandler for App {
         self.sync_focus();
     }
     fn popup_destroyed(&mut self, _: PopupSurface) {
+        self.frame_dirty = true;
+        self.scene_generation = self.scene_generation.wrapping_add(1);
         self.popups.cleanup();
     }
     fn title_changed(&mut self, surface: ToplevelSurface) {
@@ -647,6 +874,23 @@ impl XdgShellHandler for App {
     }
     fn app_id_changed(&mut self, surface: ToplevelSurface) {
         self.metadata(&surface);
+    }
+}
+impl XdgDecorationHandler for App {
+    fn new_decoration(&mut self, surface: ToplevelSurface) {
+        decorations::configure(&surface, None, true);
+        self.frame_dirty = true;
+        self.configure_windows();
+    }
+    fn request_mode(&mut self, surface: ToplevelSurface, mode: DecorationMode) {
+        decorations::configure(&surface, Some(mode), true);
+        self.frame_dirty = true;
+        self.configure_windows();
+    }
+    fn unset_mode(&mut self, surface: ToplevelSurface) {
+        decorations::configure(&surface, None, true);
+        self.frame_dirty = true;
+        self.configure_windows();
     }
 }
 impl WlrLayerShellHandler for App {
@@ -668,6 +912,8 @@ impl WlrLayerShellHandler for App {
         }
     }
     fn layer_destroyed(&mut self, surface: LayerSurface) {
+        self.frame_dirty = true;
+        self.scene_generation = self.scene_generation.wrapping_add(1);
         self.mapped_layer_surfaces.remove(surface.wl_surface());
         self.layer_views.retain(|l| l.layer_surface() != &surface);
         let mut map = layer_map_for_output(&self.output);
@@ -694,6 +940,7 @@ impl ClientData for ClientState {
 delegate_compositor!(App);
 delegate_shm!(App);
 delegate_xdg_shell!(App);
+delegate_xdg_decoration!(App);
 delegate_seat!(App);
 delegate_data_device!(App);
 delegate_output!(App);
@@ -814,6 +1061,7 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
         dh: dh.clone(),
         compositor: CompositorState::new::<App>(&dh),
         xdg: XdgShellState::new::<App>(&dh),
+        _decorations: XdgDecorationState::new::<App>(&dh),
         shm: ShmState::new::<App>(&dh, vec![]),
         data: DataDeviceState::new::<App>(&dh),
         layers: WlrLayerShellState::new::<App>(&dh),
@@ -834,6 +1082,14 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
         drag: None,
         scale: config.scale,
         glass_ready: false,
+        frame_dirty: true,
+        scene_generation: 1,
+        rendered_frames: 0,
+        scene_captures: 0,
+        blur_passes: 0,
+        capture_available: false,
+        capture_subscribers: 0,
+        capture_stop_requested: false,
     };
     app.model.socket_name = config.socket.clone();
     app.model.workspace.menu_bar_height = 0.;
@@ -842,6 +1098,12 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let (tx, rx) = calloop::channel::channel::<Command>();
     events.handle().insert_source(rx, |event, _, app| {
         if let calloop::channel::Event::Msg(command) = event {
+            if !matches!(
+                command.text.split_whitespace().next(),
+                Some("status" | "windows")
+            ) {
+                app.frame_dirty = true;
+            }
             let result = app
                 .control(&command.text)
                 .unwrap_or_else(|e| format!("ERR {e}"));
@@ -865,9 +1127,27 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let mut presented = 0u64;
     let mut glass_renderer: Option<GlassRenderer> = None;
     let mut glass_initialization_attempted = false;
+    let mut previous_scene_key = app.scene_key();
+    let mut capture_producer = None;
+    {
+        let (renderer, _) = backend.bind()?;
+        match CaptureConfig::from_env(backend_size(config.size)) {
+            Ok(Some(config)) => match CaptureProducer::new(renderer, config) {
+                Ok(capture) => {
+                    capture_producer = Some(capture);
+                    app.capture_available = true;
+                }
+                Err(error) => tracing::warn!(%error,"screen capture unavailable"),
+            },
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error,"screen capture configuration invalid"),
+        }
+    }
     while !app.model.should_exit && !stop.load(Ordering::Relaxed) {
         let status = input.dispatch_new_events(|event| match event {
-            WinitEvent::Resized { .. } => {}
+            WinitEvent::Resized { .. } | WinitEvent::Redraw => {
+                app.frame_dirty = true;
+            }
             WinitEvent::Input(event) => handle_input(&mut app, event),
             WinitEvent::CloseRequested => app.model.should_exit = true,
             _ => {}
@@ -888,14 +1168,60 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
         let now = Instant::now();
         app.model.tick_frame((now - last).as_secs_f32());
         last = now;
+        let scene_key = app.scene_key();
+        if previous_scene_key != scene_key {
+            app.scene_generation = app.scene_generation.wrapping_add(1);
+            app.frame_dirty = true;
+            previous_scene_key = scene_key;
+        }
+        if config.smoke && start.elapsed() > Duration::from_secs(15) {
+            return Err("smoke timed out without completed real client frames".into());
+        }
+        if app.capture_stop_requested {
+            if let Some(capture) = &mut capture_producer {
+                capture.revoke();
+            }
+            app.capture_stop_requested = false;
+        }
+        let capture_subscribers = capture_producer
+            .as_ref()
+            .map_or(0, |c| c.subscriber_count());
+        if app.capture_subscribers != capture_subscribers {
+            // Keep the sharing indicator and its Stop action reachable even
+            // above fullscreen content, and redraw when that visibility changes.
+            app.capture_subscribers = capture_subscribers;
+            app.frame_dirty = true;
+        }
+        let capture_due = capture_producer
+            .as_ref()
+            .is_some_and(|c| c.wants_frame(now));
+        if let Some(capture) = &mut capture_producer
+            && capture.has_pending()
+        {
+            let (renderer, _) = backend.bind()?;
+            if let Err(error) = capture.poll(renderer) {
+                tracing::warn!(%error,"capture completion failed");
+            }
+        }
+        if !app.frame_dirty && !capture_due {
+            display.flush_clients()?;
+            continue;
+        }
         let damage = smithay::utils::Rectangle::from_size(size);
         let mut rendered = Vec::new();
         {
             let (renderer, mut framebuffer) = backend.bind()?;
-            let mut elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+            let mut foreground: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = Vec::new();
+            let mut scene: Vec<SceneElement> = Vec::new();
             let mut panels = Vec::new();
             let map = layer_map_for_output(&app.output);
             for layer in [Layer::Overlay, Layer::Top] {
+                if layer == Layer::Top
+                    && app.fullscreen_window().is_some()
+                    && app.capture_subscribers == 0
+                {
+                    continue;
+                }
                 for surface in map.layers_on(layer).rev() {
                     if !with_renderer_surface_state(surface.wl_surface(), |s| s.buffer().is_some())
                         .unwrap_or(false)
@@ -905,7 +1231,10 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
                     if let Some(geo) = map.layer_geometry(surface) {
                         if matches!(
                             surface.namespace(),
-                            "aura-menu-bar" | "aura-dock" | "aura-launcher"
+                            "aura-menu-bar"
+                                | "aura-dock"
+                                | "aura-launcher"
+                                | "aura-screen-cast-consent"
                         ) {
                             let mut material = app.model.glass_material;
                             if surface.namespace() == "aura-menu-bar" {
@@ -926,7 +1255,7 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
                                 elevation_px: 16.,
                             });
                         }
-                        elements.extend(render_elements_from_surface_tree(
+                        foreground.extend(render_elements_from_surface_tree(
                             renderer,
                             surface.wl_surface(),
                             geo.loc.to_physical(config.scale),
@@ -938,7 +1267,6 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
-            let foreground_count = elements.len();
             for top in app.toplevels.iter().rev().filter(|t| t.mapped) {
                 if let Some(node) = app
                     .model
@@ -954,7 +1282,9 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
                         .find(|r| r.window_id == node.id)
                         .map(|r| r.rect)
                         .unwrap_or(node.computed_rect);
-                    let loc: Point<i32, Logical> = (rect.x as i32, rect.y as i32).into();
+                    let decorated = app.server_decorated(top, node.flags);
+                    let content = decorations::content_rect(rect, decorated);
+                    let loc: Point<i32, Logical> = (content.x as i32, content.y as i32).into();
                     let geometry = with_states(top.surface.wl_surface(), |s| {
                         s.cached_state
                             .get::<XdgSurfaceCachedState>()
@@ -966,25 +1296,53 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
                         PopupManager::popups_for_surface(top.surface.wl_surface())
                     {
                         let offset = loc + geometry.loc + location - popup.geometry().loc;
-                        elements.extend(render_elements_from_surface_tree(
+                        scene.extend(
+                            render_elements_from_surface_tree::<
+                                GlesRenderer,
+                                WaylandSurfaceRenderElement<GlesRenderer>,
+                            >(
+                                renderer,
+                                popup.wl_surface(),
+                                offset.to_physical(config.scale),
+                                config.scale as f64,
+                                1.,
+                                Kind::Unspecified,
+                            )
+                            .into_iter()
+                            .map(SceneElement::from),
+                        );
+                        rendered.push(popup.wl_surface().clone());
+                    }
+                    scene.extend(
+                        render_elements_from_surface_tree::<
+                            GlesRenderer,
+                            WaylandSurfaceRenderElement<GlesRenderer>,
+                        >(
                             renderer,
-                            popup.wl_surface(),
-                            offset.to_physical(config.scale),
+                            top.surface.wl_surface(),
+                            loc.to_physical(config.scale),
                             config.scale as f64,
                             1.,
                             Kind::Unspecified,
-                        ));
-                        rendered.push(popup.wl_surface().clone());
-                    }
-                    elements.extend(render_elements_from_surface_tree(
-                        renderer,
-                        top.surface.wl_surface(),
-                        loc.to_physical(config.scale),
-                        config.scale as f64,
-                        1.,
-                        Kind::Unspecified,
-                    ));
+                        )
+                        .into_iter()
+                        .map(SceneElement::from),
+                    );
                     rendered.push(top.surface.wl_surface().clone());
+                    if decorated {
+                        for control in decorations::controls(rect) {
+                            scene.push(solid(control.rect, control.color, config.scale));
+                        }
+                        scene.push(solid(
+                            decorations::titlebar_rect(rect),
+                            if node.flags.contains(WindowStateFlags::FOCUSED) {
+                                [0.20, 0.25, 0.33, 1.]
+                            } else {
+                                [0.13, 0.16, 0.21, 1.]
+                            },
+                            config.scale,
+                        ));
+                    }
                 }
             }
             for layer in [Layer::Bottom, Layer::Background] {
@@ -995,20 +1353,27 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
                         continue;
                     }
                     if let Some(geo) = map.layer_geometry(surface) {
-                        elements.extend(render_elements_from_surface_tree(
-                            renderer,
-                            surface.wl_surface(),
-                            geo.loc.to_physical(config.scale),
-                            config.scale as f64,
-                            1.,
-                            Kind::Unspecified,
-                        ));
+                        scene.extend(
+                            render_elements_from_surface_tree::<
+                                GlesRenderer,
+                                WaylandSurfaceRenderElement<GlesRenderer>,
+                            >(
+                                renderer,
+                                surface.wl_surface(),
+                                geo.loc.to_physical(config.scale),
+                                config.scale as f64,
+                                1.,
+                                Kind::Unspecified,
+                            )
+                            .into_iter()
+                            .map(SceneElement::from),
+                        );
                         rendered.push(surface.wl_surface().clone());
                     }
                 }
             }
             drop(map);
-            let has_client = !elements.is_empty() && app.toplevels.iter().any(|t| t.mapped);
+            let has_client = !scene.is_empty() && app.toplevels.iter().any(|t| t.mapped);
             if !glass_initialization_attempted {
                 glass_initialization_attempted = true;
                 match GlassRenderer::new(renderer, size) {
@@ -1018,15 +1383,15 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
-            let (foreground, scene) = elements.split_at(foreground_count);
             let result = glass_renderer.as_mut().map(|glass| {
                 glass.render_scene(
                     renderer,
                     &mut framebuffer,
                     size,
                     config.scale as f64,
-                    scene,
-                    foreground,
+                    app.scene_generation,
+                    &scene,
+                    &foreground,
                     &panels,
                     &app.model.glass_material,
                     Color32F::new(0.065, 0.085, 0.14, 1.),
@@ -1039,7 +1404,7 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
                 }
                 let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
                 frame.clear(Color32F::new(0.065, 0.085, 0.14, 1.), &[damage])?;
-                draw_render_elements(&mut frame, config.scale as f64, scene, &[damage])?;
+                draw_render_elements(&mut frame, config.scale as f64, &scene, &[damage])?;
                 for panel in &panels {
                     let r = smithay::utils::Rectangle::new(
                         (panel.rect.x as i32, panel.rect.y as i32).into(),
@@ -1055,13 +1420,35 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
                         &[r],
                     )?;
                 }
-                draw_render_elements(&mut frame, config.scale as f64, foreground, &[damage])?;
+                draw_render_elements(&mut frame, config.scale as f64, &foreground, &[damage])?;
                 let _sync = frame.finish()?;
+            }
+            if let Some(glass) = &glass_renderer {
+                let stats = glass.stats();
+                app.scene_captures = stats.scene_captures;
+                app.blur_passes = stats.blur_passes;
+            }
+            if let Some(capture) = &mut capture_producer {
+                // Completion polling uses a surfaceless EGL context, so it must
+                // happen before binding/rendering the output, never before swap.
+                if let Err(error) = capture.set_output_size(size) {
+                    tracing::warn!(%error,"capture resize failed");
+                }
+                if capture_due {
+                    let mut frame =
+                        renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
+                    if let Err(error) = capture.enqueue(&mut frame, size) {
+                        tracing::warn!(%error,"capture enqueue failed");
+                    }
+                    let _sync = frame.finish()?;
+                }
             }
             if has_client {
                 presented += 1;
             }
         }
+        app.rendered_frames = app.rendered_frames.wrapping_add(1);
+        app.frame_dirty = false;
         backend.submit(Some(&[damage]))?;
         for surface in rendered {
             send_frames(&surface, start.elapsed().as_millis() as u32);
@@ -1075,11 +1462,19 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
                 presented,
                 "Smoke test: real client buffers rendered and frame callbacks sent"
             );
+            if let Some(capture) = &mut capture_producer {
+                let (renderer, _) = backend.bind()?;
+                capture.shutdown(renderer)?;
+            }
             return Ok(());
         }
         if config.smoke && start.elapsed() > Duration::from_secs(15) {
             return Err("smoke timed out without real client frames".into());
         }
+    }
+    if let Some(capture) = &mut capture_producer {
+        let (renderer, _) = backend.bind()?;
+        capture.shutdown(renderer)?;
     }
     if config.smoke && presented < 2 {
         return Err("compositor closed before smoke completed".into());
@@ -1173,6 +1568,24 @@ fn handle_input(app: &mut App, event: InputEvent<smithay::backend::winit::WinitI
         }
         InputEvent::PointerButton { event } => {
             let pointer = app.seat.get_pointer().unwrap();
+            if event.state() == ButtonState::Pressed
+                && let Some((id, rect, hit)) = app.chrome_under()
+            {
+                app.focus(id);
+                match hit {
+                    DecorationHit::Control(action) => app.action(id, action),
+                    DecorationHit::Titlebar => {
+                        app.drag = Some(Drag {
+                            id,
+                            origin: app.pointer,
+                            rect,
+                            edges: None,
+                        });
+                    }
+                }
+                app.frame_dirty = true;
+                return;
+            }
             pointer.motion(
                 app,
                 app.surface_under(),
@@ -1232,4 +1645,29 @@ fn handle_input(app: &mut App, event: InputEvent<smithay::backend::winit::WinitI
         }
         _ => {}
     }
+}
+
+fn backend_size(size: (i32, i32)) -> smithay::utils::Size<i32, smithay::utils::Physical> {
+    size.into()
+}
+fn solid(rect: Rect, color: [f32; 4], scale: i32) -> SceneElement {
+    SolidColorRenderElement::new(
+        Id::new(),
+        smithay::utils::Rectangle::new(
+            (
+                (rect.x * scale as f32).round() as i32,
+                (rect.y * scale as f32).round() as i32,
+            )
+                .into(),
+            (
+                (rect.width * scale as f32).round() as i32,
+                (rect.height * scale as f32).round() as i32,
+            )
+                .into(),
+        ),
+        CommitCounter::default(),
+        Color32F::new(color[0], color[1], color[2], color[3]),
+        Kind::Unspecified,
+    )
+    .into()
 }
