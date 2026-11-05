@@ -4,9 +4,9 @@ This document specifies design targets. Its equations, protocol lists and visual
 
 ## 1. Executive Summary & Architectural Vision
 
-**Aura Desktop Environment (`aura-de`)** is a next-generation Linux desktop environment engineered from scratch in Rust around Wayland. It unites macOS spatial desktop ergonomics—a persistent 32px Top Menu Bar, a parabolic-magnification Floating Dock, traffic-light window controls, Stage Manager side-strips, and interruptible spring animations—with a physical GPU shader pipeline called **Liquid Glass**.
+**Aura Desktop Environment (`aura-de`)** is a next-generation Linux desktop environment engineered from scratch in Rust around Wayland. Its shell combines a persistent 32px Top Menu Bar, a parabolic-magnification Floating Dock, traffic-light window controls, Stage Manager side-strips, and interruptible spring animations with a physical GPU shader pipeline called **Liquid Glass**.
 
-Whereas conventional Linux compositors treat background blur as a flat 2D box/Gaussian filter clipped to circular rounded rectangles, Aura DE models every shell surface and window titlebar as a curved dielectric optical lens ($n_{\text{glass}} = 1.48$). Each surface evaluates a continuous-curvature $L_4$ superellipse (macOS squircle) Signed Distance Field, reconstructs 3D bevel surface normals along its perimeter, bends background rays via Snell's law with RGB chromatic dispersion, and layers a directional Schlick Fresnel specular highlight over a bandwidth-efficient [Dual-Kawase](https://blog.frost.kiwi/dual-kawase/) blur mip pyramid.
+Whereas conventional Linux compositors treat background blur as a flat 2D box/Gaussian filter clipped to circular rounded rectangles, Aura DE models every shell surface and window titlebar as a curved dielectric optical lens ($n_{\text{glass}} = 1.48$). Each surface evaluates a continuous-curvature $L_4$ superellipse (squircle) Signed Distance Field, reconstructs 3D bevel surface normals along its perimeter, bends background rays via Snell's law with RGB chromatic dispersion, and layers a directional Schlick Fresnel specular highlight over a bandwidth-efficient [Dual-Kawase](https://blog.frost.kiwi/dual-kawase/) blur mip pyramid.
 
 ## 2. System Architecture & Crate Boundaries
 
@@ -18,7 +18,7 @@ To keep core window layout logic 100% deterministic and testable without a GPU o
 | `crates/aura-render` | 64-byte `std140` uniform packers, Dual-Kawase FBO mip planner, and dual-target shaders (`liquid_glass.wgsl` + `liquid_glass.frag`) | `wgpu`, `bytemuck`, `glam`, `aura-core` | GPU shader compilation & uniform buffer alignment |
 | `crates/aura-compositor` | Wayland display server (`xdg-shell`, `wlr-layer-shell`, `ext-background-effect-v1`), damage-tracked backdrop pyramid, input routing | `smithay`, `calloop`, `wayland-server`, `aura-core`, `aura-render` | Wayland sockets, DRM/KMS, GBM, EGL, `libinput`, `libseat` |
 | `crates/aura-shell` | Client-side layer-shell Menu Bar (`32px` exclusive zone), Floating Liquid Glass Dock, and `org.aura.Shell1` D-Bus service | `smithay-client-toolkit`, `wgpu`, `zbus`, `tokio` | Wayland client socket (`wlr-layer-shell`), D-Bus session bus |
-| `crates/aura-launcher` | Spotlight-style command & fuzzy app launcher overlay (`SpotlightIndex`) | `wgpu`, `smithay-client-toolkit`, `serde` | Wayland `wlr-layer-shell` (`Overlay` layer, keyboard interactivity) |
+| `crates/aura-launcher` | Command & fuzzy app launcher overlay (`SpotlightIndex`) | `wgpu`, `smithay-client-toolkit`, `serde` | Wayland `wlr-layer-shell` (`Overlay` layer, keyboard interactivity) |
 | `crates/aura-session` | Session bootstrapper, fullscreen direct-scanout evaluator, and `org.freedesktop.impl.portal.ScreenCast` PipeWire portal | `zbus`, `tokio`, `aura-core` | `systemd-logind`, PipeWire DMA-BUF screencast streams |
 
 ## 3. Liquid Glass Optical Design System & Shader Pipeline
@@ -44,7 +44,7 @@ To keep core window layout logic 100% deterministic and testable without a GPU o
 
 ## 4. Spatial Window Management, Stage Manager & Animation Physics
 
-* **Floating Mode (Default macOS Ergonomics)**: Windows spawn cascaded around the workspace center with server-negotiated Liquid Glass titlebars (`xdg-decoration-unstable-v1`), top-left Traffic Light buttons (`Close` in `#FF5F56`, `MinimizeToDock` in `#FFBD2E`, `ToggleZoomFullscreen` in `#27C93F`), and Sequoia-style edge-drag smart snap zones.
+* **Floating Mode (Default)**: Windows spawn cascaded around the workspace center with server-negotiated Liquid Glass titlebars (`xdg-decoration-unstable-v1`), top-left Traffic Light buttons (`Close` in `#FF5F56`, `MinimizeToDock` in `#FFBD2E`, `ToggleZoomFullscreen` in `#27C93F`), and edge-drag smart snap zones.
 * **Stage Manager Mode**: Keeps the focused window centered on the main stage while docking background windows into a `196px`-wide left-hand vertical strip of live Liquid Glass thumbnails (`132px` height each).
 * **Dynamic Tiling Mode**: Automatically arranges windows into a 55% master / 45% vertical stack split for keyboard-centric engineering workflows.
 * **Critically Damped Springs & Parabolic Dock Magnification**: Interruptible second-order springs ($\omega_0 = 24.0\text{ rad/s}, \zeta = 1.0$) must handle variable frame time and suspend/resume without diverging. A raised-cosine Dock icon magnifier targets `52px` to `84px` peak.

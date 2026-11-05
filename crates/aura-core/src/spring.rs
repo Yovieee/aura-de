@@ -1,4 +1,4 @@
-//! Critically damped spring physics for interruptible macOS-style window and Dock animations.
+//! Critically damped spring physics for interruptible window and Dock animations.
 
 use serde::{Deserialize, Serialize};
 

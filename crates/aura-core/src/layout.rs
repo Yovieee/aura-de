@@ -1,4 +1,4 @@
-//! Hybrid macOS Floating, Stage Manager strip, and Smart-Snap Tiling window layout engine.
+//! Hybrid Floating, Stage Manager strip, and Smart-Snap Tiling window layout engine.
 
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};

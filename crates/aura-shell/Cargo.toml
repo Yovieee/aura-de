@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "macOS-style Liquid Glass Top Menu Bar, Parabolic Dock, and zbus D-Bus session daemon"
+description = "Liquid Glass Top Menu Bar, Parabolic Dock, and zbus D-Bus session daemon"
 
 [[bin]]
 name = "aura-shell"

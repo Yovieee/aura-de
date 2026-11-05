@@ -1,4 +1,4 @@
-//! macOS-inspired Floating Dock continuous parabolic magnification solver.
+//! Floating Dock continuous parabolic magnification solver.
 
 use serde::{Deserialize, Serialize};
 

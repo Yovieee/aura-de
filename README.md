@@ -1,10 +1,26 @@
 # Aura Desktop Environment
 
-Aura DE is an experimental Linux desktop written in Rust, with a Wayland compositor and a macOS-inspired shell. The workspace separates pure layout/animation models, rendering, compositor, shell, launcher, and session management into six crates.
+Aura DE is an experimental Linux desktop written in Rust, with a Wayland compositor and a graphical shell. The workspace separates pure layout/animation models, rendering, compositor, shell, launcher, and session management into six crates.
 
 This is a nested, single-output development desktop. It includes Wayland client lifecycle and input handling, negotiated server-side window controls, fullscreen policy, layer-shell panels and an XDG application launcher. Glass rendering retains the scene/blur textures and skips unchanged frames. ScreenCast exports an approved monitor source through real PipeWire buffers; its integration gate and current limits are recorded in [implementation status](docs/implementation-status.md).
 
 This is development software, with no claim of a working native DRM/KMS session. ScreenCast is limited to a single monitor, hidden cursor and fixed-size SDR RGBA frames, at most 4096 pixels per axis. Resizing ends the stream and requires fresh selection/consent. Hardware performance, zero-copy capture, HDR and multioutput are not established.
+
+## Screenshots
+
+Captured from a running nested session with Mesa software rendering. The windows and launcher entries shown here are development samples.
+
+**Tiled windows, menu bar, and Dock**
+
+![Aura DE with two tiled sample Wayland windows and server-side window controls](docs/screenshots/desktop.png)
+
+**Application search with a glass backdrop**
+
+![Aura application launcher searching demo entries over a blurred desktop](docs/screenshots/launcher.png)
+
+**Screen sharing consent, with Deny selected by default**
+
+![Aura ScreenCast consent dialog showing the requesting application and Deny and Allow buttons](docs/screenshots/screencast-consent.png)
 
 ## Build on Linux
 
