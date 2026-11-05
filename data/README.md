@@ -18,12 +18,19 @@ Portal activation data belongs under `$prefix/share/dbus-1/services/` and
 is installed in PATH; package managers may replace Exec with an absolute path.
 No process or D-Bus state survives a cloud snapshot; start the session again.
 
-The portal service exposes the standard ScreenCast backend method signatures,
-real control-session Close and disconnect cleanup, and reports
-`AvailableSourceTypes = 0`. Capture methods return `NotSupported` because the
-compositor does not yet provide a PipeWire capture transport. It never returns
-invented stream/node IDs. Installing these descriptors does not enable screen
-sharing; retain another portal backend if that functionality is required.
+The supervised portal service probes its authenticated compositor source and a
+real PipeWire daemon before advertising a monitor capability. ScreenCast needs
+explicit consent; the shell indicates active sharing and provides Stop. Close,
+revocation and frontend disconnect remove the compositor subscription and actual
+PipeWire node. Standalone `aura-session --portal` has no supervisor capability and
+does not grant capture access. No simulated node IDs are returned.
+
+Capture supports one monitor with hidden cursor, fixed-size SDR RGBA pixels and
+at most 4096 pixels per axis. Output resize ends a stream and requires fresh
+selection/consent. This is a CPU-copy path, not zero-copy DMA-BUF capture. Native
+hardware sessions, HDR and multioutput remain unsupported. Installing descriptors
+alone does not create a supervised source, daemon or user consent. See
+`docs/screencast.md` and the observed evidence in `docs/implementation-status.md`.
 
 To test activation on a desktop host, install descriptors to a user or system
 XDG data directory and run `aura-session --portal` on a private session bus. Do not

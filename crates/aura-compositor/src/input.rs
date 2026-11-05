@@ -1,4 +1,4 @@
-//! `input.rs`: Slice 4 — `libinput` 3-finger touchpad swipe gestures and macOS Traffic Light hit-testing.
+//! `input.rs`: Slice 4 — `libinput` 3-finger touchpad swipe gestures and Traffic Light hit-testing.
 
 use aura_core::{LayoutMode, Rect, SnapZone, TrafficLightAction, WindowId};
 

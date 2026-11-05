@@ -1,5 +1,6 @@
 //! Session entry point. A compositor, its shell, and their cleanup have one owner.
 
+mod capture;
 mod portal;
 mod scanout;
 mod supervisor;
@@ -39,7 +40,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(async {
         if options.portal_only {
             let _service = portal::serve().await?;
-            tracing::info!("Aura portal backend exported; screen capture is not supported yet");
+            tracing::info!(
+                "Aura portal backend exported; standalone capture capabilities are unavailable"
+            );
             supervisor::shutdown_signal().await?;
             Ok::<(), Box<dyn std::error::Error>>(())
         } else {

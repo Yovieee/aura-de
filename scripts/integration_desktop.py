@@ -125,8 +125,8 @@ def main() -> int:
             fixture=launch("layer-lifecycle",[str(binaries["layer_lifecycle"])],client_environment)
             require(fixture.wait(timeout=args.timeout)==0,"layer NULL-buffer unmap/remap regression failed")
             wait_for(lambda:json.loads(command(control,"status"))["layers"]==0,"layer fixture cleanup",server,args.timeout)
-            first = launch("client-one", [str(binaries["client"]), "--frames", "2", "--exercise-lifecycle", "--exercise-popup", "--stay", "--title", "AuraSmokeOne"], client_environment)
-            second = launch("client-two", [str(binaries["client"]), "--frames", "2", "--stay", "--title", "AuraSmokeTwo"], client_environment)
+            first = launch("client-one", [str(binaries["client"]), "--frames", "2", "--exercise-lifecycle", "--exercise-fullscreen", "--exercise-popup", "--decoration-mode", "client", "--stay", "--title", "AuraSmokeOne"], client_environment)
+            second = launch("client-two", [str(binaries["client"]), "--frames", "2", "--exercise-fullscreen", "--decoration-mode", "server", "--stay", "--title", "AuraSmokeTwo"], client_environment)
 
             def ready():
                 for name, process in [("client-one", first), ("client-two", second)]:

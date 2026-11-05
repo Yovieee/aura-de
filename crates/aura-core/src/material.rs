@@ -59,7 +59,7 @@ pub struct LiquidGlassMaterial {
 }
 
 impl LiquidGlassMaterial {
-    /// Default macOS-inspired Liquid Glass preset for the Floating Dock and Top Menu Bar.
+    /// Default Liquid Glass preset for the Floating Dock and Top Menu Bar.
     pub fn macos_dock_default() -> Self {
         Self {
             ior: 1.48,
@@ -151,7 +151,7 @@ impl LiquidGlassMaterial {
         Ok(())
     }
 
-    /// Evaluate the $L_4$ superellipse (continuous-curvature macOS squircle) Signed Distance Field.
+    /// Evaluate the $L_4$ superellipse (continuous-curvature squircle) Signed Distance Field.
     pub fn squircle_sdf(&self, point_from_center: Vec2, half_extents: Vec2) -> f32 {
         let r = self.corner_radius.min(half_extents.x.min(half_extents.y));
         let q = point_from_center.abs() - (half_extents - Vec2::splat(r));

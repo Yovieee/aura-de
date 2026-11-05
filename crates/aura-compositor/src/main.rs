@@ -1,6 +1,9 @@
 //! Aura's nested Wayland server. Native hardware backends remain explicitly unsupported.
+mod capture;
+mod decorations;
 mod glass;
 mod runtime;
+mod scene;
 
 use aura_core::GlassQualityPreset;
 use std::{env, error::Error};

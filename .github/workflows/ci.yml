@@ -14,7 +14,7 @@ env:
 jobs:
   linux:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Install host dependencies
@@ -34,20 +34,44 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run Rust tests
         run: cargo test --workspace --locked
+      - name: Build real integration clients and capture consumers
+        run: |
+          cargo build --workspace --bins --locked
+          cargo build -p aura-compositor --example smoke_client --locked
+          cargo build -p aura-session --examples --locked
       - name: Nested Wayland integration smoke
         run: python3 scripts/smoke_nested.py --software
       - name: Desktop lifecycle integration
         run: python3 scripts/integration_desktop.py --software
       - name: Session and real input integration
         run: python3 scripts/session_smoke.py --no-build
+      - name: Idle rendering, retained glass cache and window chrome
+        run: python3 scripts/window_render_smoke.py --no-build
       - name: GPU pixel readback and GLES driver compilation
         run: |
-          cargo test -p aura-render --test gpu --locked -- --ignored --nocapture
-          cargo test -p aura-render --test gles --locked -- --ignored --nocapture
+          set -o pipefail
+          mkdir -p target/driver-logs
+          cargo test -p aura-render --test gpu --locked -- --ignored --nocapture 2>&1 | tee target/driver-logs/wgpu.log
+          cargo test -p aura-render --test gles --locked -- --ignored --nocapture 2>&1 | tee target/driver-logs/gles.log
+      - name: Asynchronous composed-frame PBO readback
+        run: |
+          set -o pipefail
+          LIBGL_ALWAYS_SOFTWARE=1 EGL_PLATFORM=surfaceless cargo test -p aura-compositor --bin aura-compositor capture::tests::gles_pbo_capture_preserves_pack_state_and_reads_composed_rows --locked -- --ignored --exact --nocapture 2>&1 | tee target/driver-logs/pbo.log
       - name: Private D-Bus services
         run: |
           dbus-run-session -- cargo test -p aura-session portal_dbus_lifecycle --locked -- --ignored
+          dbus-run-session -- cargo test -p aura-session portal_dbus_consent_denial_and_request_cancellation --locked -- --ignored
           dbus-run-session -- cargo run -p aura-shell --example dbus_smoke --locked
+      - name: Bounded and cancellable capture connection
+        run: |
+          set -o pipefail
+          cargo test -p aura-session capture::tests::saturated_backlog_connect_is_bounded_and_cancellable --locked -- --ignored --exact 2>&1 | tee target/capture-connect.log
+      - name: Real PipeWire exact-pixel roundtrip and node teardown
+        run: |
+          set -o pipefail
+          python3 crates/aura-session/tests/pipewire_roundtrip.py 2>&1 | tee target/pipewire-roundtrip.log
+      - name: ScreenCast consent, composed frames and revocation
+        run: python3 scripts/screencast_smoke.py --no-build
       - name: Save smoke logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -57,4 +81,9 @@ jobs:
             target/smoke-logs/
             target/desktop-smoke-logs/
             target/session-smoke-logs/
+            target/window-render-smoke-logs/
+            target/screencast-smoke-logs/
+            target/driver-logs/
+            target/pipewire-roundtrip.log
+            target/capture-connect.log
           if-no-files-found: ignore

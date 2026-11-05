@@ -51,12 +51,12 @@ done
 # Keep the dynamically loaded X11 keyboard runtime explicit, including for Xvfb tests.
 packages=(build-essential pkg-config python3 curl ca-certificates
           libwayland-dev libegl1-mesa-dev libgles2-mesa-dev
-          libxkbcommon-dev libxkbcommon-x11-0)
+          libxkbcommon-dev libxkbcommon-x11-0 libpipewire-0.3-dev libclang-dev clang)
 if "$native"; then
-    packages+=(libdrm-dev libgbm-dev libinput-dev libseat-dev libudev-dev libpipewire-0.3-dev)
+    packages+=(libdrm-dev libgbm-dev libinput-dev libseat-dev libudev-dev)
 fi
 if "$testing"; then
-    packages+=(xvfb xauth mesa-vulkan-drivers libgl1-mesa-dri dbus-x11 wayland-utils libxtst6)
+    packages+=(xvfb xauth mesa-vulkan-drivers libgl1-mesa-dri dbus-x11 libglib2.0-bin wayland-utils libxtst6 pipewire-bin libpipewire-0.3-modules libspa-0.2-modules)
 fi
 if "$dry_run"; then
     printf 'Prefix: %s\nAPT state: %s\n' "$prefix" "$state_root"
@@ -155,7 +155,9 @@ for _, archive in selected.values():
 # because the host already provides it. Repair only broken development links,
 # and only to an existing matching basename in the host library directory.
 triplet = subprocess.check_output(["cc", "-dumpmachine"], text=True).strip()
-library_dir = prefix / "usr/lib" / triplet
+# LLVM's libclang development links live beside, rather than inside, the
+# multiarch directory, so include both layouts in this host-overlay repair.
+library_dir = prefix / "usr/lib"
 host_dir = Path("/usr/lib") / triplet
 repaired = 0
 if library_dir.is_dir():

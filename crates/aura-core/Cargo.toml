@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Pure window management, macOS Dock magnification, spring physics, and Liquid Glass optical model for Aura DE"
+description = "Pure window management, Dock magnification, spring physics, and Liquid Glass optical model for Aura DE"
 
 [dependencies]
 glam = { workspace = true }

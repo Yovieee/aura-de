@@ -28,11 +28,16 @@ def verify_toml_manifests() -> None:
 def verify_paths() -> None:
     for path in (ROOT / "crates").rglob("*.rs"):
         source = path.read_text()
-        for match in re.finditer(r"(?:pub\s+)?mod\s+([A-Za-z0-9_]+)\s*;", source):
-            name = match.group(1)
-            assert (path.parent / f"{name}.rs").exists() or (path.parent / name / "mod.rs").exists(), (
-                f"Unresolved module {name} in {path}"
-            )
+        for match in re.finditer(
+            r"(?P<attributes>(?:#\[[^\n]*\]\s*)*)(?:pub\s+)?mod\s+(?P<name>[A-Za-z0-9_]+)\s*;",
+            source,
+        ):
+            name = match.group("name")
+            explicit = re.search(r'#\[path\s*=\s*"([^\"]+)"\]', match.group("attributes"))
+            candidates = [path.parent / explicit.group(1)] if explicit else [
+                path.parent / f"{name}.rs", path.parent / name / "mod.rs",
+            ]
+            assert any(candidate.is_file() for candidate in candidates), f"Unresolved module {name} in {path}"
         for match in re.finditer(r'include_str!\("([^"]+)"\)', source):
             included = (path.parent / match.group(1)).resolve()
             assert included.is_file() and included.stat().st_size > 0, f"Missing embedded file {included}"
