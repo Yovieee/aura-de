@@ -2,7 +2,7 @@
 
 Aura DE is an experimental Linux desktop written in Rust, with a Wayland compositor and a graphical shell. The workspace separates pure layout/animation models, rendering, compositor, shell, launcher, and session management into six crates.
 
-This is a nested, single-output development desktop. It includes Wayland client lifecycle and input handling, negotiated server-side window controls, fullscreen policy, layer-shell panels and an XDG application launcher. Glass rendering retains the scene/blur textures and skips unchanged frames. ScreenCast exports an approved monitor source through real PipeWire buffers; its integration gate and current limits are recorded in [implementation status](docs/implementation-status.md).
+This is a nested, single-output development desktop. It includes Wayland client lifecycle and input handling, negotiated server-side window controls, fullscreen policy, layer-shell panels and an XDG application launcher. The launcher and Dock refresh installed applications automatically, support terminal commands and D-Bus activation, and magnify Dock app tiles under the pointer. Glass rendering retains the scene/blur textures and skips unchanged frames. ScreenCast exports an approved monitor source through real PipeWire buffers; its integration gate and current limits are recorded in [implementation status](docs/implementation-status.md).
 
 This is development software, with no claim of a working native DRM/KMS session. ScreenCast is limited to a single monitor, hidden cursor and fixed-size SDR RGBA frames, at most 4096 pixels per axis. Resizing ends the stream and requires fresh selection/consent. Hardware performance, zero-copy capture, HDR and multioutput are not established.
 
@@ -58,12 +58,13 @@ cargo build --workspace --bins --examples --locked
 python3 scripts/smoke_nested.py --no-build --software
 python3 scripts/integration_desktop.py --no-build --software
 python3 scripts/session_smoke.py --no-build
+python3 scripts/launcher_dock_smoke.py --no-build
 python3 scripts/window_render_smoke.py --no-build
 python3 crates/aura-session/tests/pipewire_roundtrip.py
 python3 scripts/screencast_smoke.py --no-build
 ```
 
-The Python structure check verifies manifests and source paths only. Rust tests exercise the implementation. The nested smoke script runs a real Wayland SHM client and waits for configure/frame events; it creates Xvfb when no host display is available. The window-render check verifies idle counters, glass-cache invalidation and real window-control input. The PipeWire fixture checks exact transported pixels; the separate ScreenCast check covers the actual compositor/consent/PipeWire path. See [capture and driver checks](docs/screencast.md) for explicit GPU tests and the meaning of each result.
+The Python structure check verifies manifests and source paths only. Rust tests exercise the implementation. The nested smoke script runs a real Wayland SHM client and waits for configure/frame events; it creates Xvfb when no host display is available. The launcher/Dock check exercises live install/edit/remove updates, terminal argument handling, real D-Bus activation/fallback and magnified click targets; see [application launching](docs/application-launching.md). The window-render check verifies idle counters, glass-cache invalidation and real window-control input. The PipeWire fixture checks exact transported pixels; the separate ScreenCast check covers the actual compositor/consent/PipeWire path. See [capture and driver checks](docs/screencast.md) for explicit GPU tests and the meaning of each result.
 
 Mesa software rendering can validate the nested development path, but cannot validate a hardware DRM/KMS session or measure hardware performance. Each graphical script retains its logs under `target`; the window-render and ScreenCast checks also save `results.json` evidence.
 

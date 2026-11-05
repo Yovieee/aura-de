@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Terminal desktop entries and bounded `org.freedesktop.Application.Activate` with shell-free Exec fallback; launcher activation runs on a worker.
+- Live application discovery for open launchers and the Dock, preserving user overrides and Hidden masking.
+- Pointer-driven Dock magnification, matching pixel drawing/hit geometry, leave reset and real input/activation regression coverage.
 - Real nested Smithay Wayland server, layer-shell clients, XDG application launching, D-Bus notifications and process supervision.
 - Executable wgpu and GLES Liquid Glass passes, real scene capture, opaque fallback and driver/readback checks.
 - Regression coverage for focus, minimize/restore, stall-safe springs, invalid materials, remap/maximize/popups and layer reservation cleanup.

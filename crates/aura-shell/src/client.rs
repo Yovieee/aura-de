@@ -44,6 +44,8 @@ pub trait DesktopUi {
         false
     }
     fn pointer(&mut self, _panel: usize, _x: f64, _y: f64, _pressed: bool) {}
+    /// Clear hover state when the pointer leaves a layer surface.
+    fn pointer_leave(&mut self, _panel: usize) {}
     /// Consume a dirty flag after input or a background-state poll.
     fn needs_redraw(&mut self) -> bool {
         false
@@ -524,12 +526,16 @@ impl PointerHandler for Client {
                 .iter()
                 .position(|p| p.layer.wl_surface() == &event.surface)
             {
-                self.ui.pointer(
-                    i,
-                    event.position.0,
-                    event.position.1,
-                    matches!(event.kind, PointerEventKind::Press { button: 0x110, .. }),
-                );
+                if matches!(event.kind, PointerEventKind::Leave { .. }) {
+                    self.ui.pointer_leave(i);
+                } else {
+                    self.ui.pointer(
+                        i,
+                        event.position.0,
+                        event.position.1,
+                        matches!(event.kind, PointerEventKind::Press { button: 0x110, .. }),
+                    );
+                }
                 self.panels[i].dirty = true;
             }
         }

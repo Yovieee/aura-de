@@ -1,7 +1,9 @@
 //! Opaque SHM fallback panel and Dock, with live D-Bus notifications.
 use aura_shell::{
+    catalog::DesktopCatalog,
     client::{self, Canvas, DesktopUi, PanelSpec},
     desktop::{self, DesktopEntryItem},
+    dock::{self, DockLayout},
     ipc::{self, SharedState},
 };
 use smithay_client_toolkit::shell::wlr_layer::{Anchor, KeyboardInteractivity, Layer};
@@ -32,7 +34,13 @@ enum Action {
 struct Shell {
     state: SharedState,
     runtime: Arc<Mutex<RuntimeState>>,
-    apps: Vec<DesktopEntryItem>,
+    apps: Arc<Vec<DesktopEntryItem>>,
+    drawn_apps: Arc<Vec<DesktopEntryItem>>,
+    drawn_windows: Vec<u64>,
+    catalog: DesktopCatalog,
+    catalog_revision: u64,
+    dock_hover: Option<(f64, f64)>,
+    dock_layout: DockLayout,
     actions: mpsc::Sender<Action>,
     redraw_fingerprint: Option<u64>,
     menu_width: u32,
@@ -40,7 +48,14 @@ struct Shell {
 impl DesktopUi for Shell {
     fn needs_redraw(&mut self) -> bool {
         use std::hash::{DefaultHasher, Hash, Hasher};
+        let snapshot = self.catalog.snapshot();
+        self.apps = snapshot.entries;
+        self.catalog_revision = snapshot.revision;
         let mut hash = DefaultHasher::new();
+        self.catalog_revision.hash(&mut hash);
+        self.dock_hover
+            .map(|(x, y)| (x.to_bits(), y.to_bits()))
+            .hash(&mut hash);
         {
             let state = self.state.lock().unwrap();
             state.reduced_transparency.hash(&mut hash);
@@ -105,43 +120,77 @@ impl DesktopUi for Shell {
                 c.text(x + 12, 12, "SHARING | Stop", 0xffffffff, 1);
             }
         } else {
-            c.text(12, 12, "Apps", 0xff9bcaff, 1);
-            for (i, app) in self.apps.iter().take(5).enumerate() {
-                let x = 76 + i as i32 * 104;
-                c.rect(x, 8, 96, 42, 0xff28384c);
+            let runtime = self.runtime.lock().unwrap();
+            self.dock_layout = dock::layout(
+                c.width,
+                c.height,
+                self.apps.len(),
+                runtime.windows.len(),
+                self.dock_hover,
+            );
+            self.drawn_apps = self.apps.clone();
+            self.drawn_windows = runtime
+                .windows
+                .iter()
+                .take(6)
+                .map(|window| window.id)
+                .collect();
+            if let Some(rect) = self.dock_layout.launcher {
+                c.rect(
+                    rect.x as i32,
+                    rect.y as i32,
+                    rect.width as u32,
+                    rect.height as u32,
+                    0xff223449,
+                );
+                c.text(rect.x as i32 + 4, rect.y as i32 + 12, "Apps", 0xff9bcaff, 1);
+            }
+            for item in &self.dock_layout.apps {
+                let app = &self.drawn_apps[item.index];
+                let rect = item.rect;
+                c.rect(
+                    rect.x as i32,
+                    rect.y as i32,
+                    rect.width as u32,
+                    rect.height as u32,
+                    0xff28384c,
+                );
+                let letters = (rect.width as usize).saturating_sub(8) / 8;
                 c.text(
-                    x + 4,
-                    24,
-                    &app.name.chars().take(11).collect::<String>(),
+                    rect.x as i32 + 4,
+                    (rect.y + rect.height * 0.5 - 4.) as i32,
+                    &app.name.chars().take(letters).collect::<String>(),
                     0xffedf2f9,
                     1,
                 );
             }
-            let runtime = self.runtime.lock().unwrap();
-            for (i, w) in runtime.windows.iter().take(6).enumerate() {
-                let x = 12 + i as i32 * 112;
+            for item in &self.dock_layout.windows {
+                let window = &runtime.windows[item.index];
+                let rect = item.rect;
                 c.rect(
-                    x,
-                    58,
-                    106,
-                    26,
-                    if w.focused { 0xff3b6084 } else { 0xff28384c },
+                    rect.x as i32,
+                    rect.y as i32,
+                    rect.width as u32,
+                    rect.height as u32,
+                    if window.focused {
+                        0xff3b6084
+                    } else {
+                        0xff28384c
+                    },
                 );
+                let title = if window.title.is_empty() {
+                    &window.app_id
+                } else {
+                    &window.title
+                };
+                let letters = (rect.width as usize).saturating_sub(6) / 8;
                 c.text(
-                    x + 3,
-                    67,
-                    &format!(
-                        "{}{}",
-                        if w.minimized { "- " } else { "" },
-                        if w.title.is_empty() {
-                            &w.app_id
-                        } else {
-                            &w.title
-                        }
-                    )
-                    .chars()
-                    .take(12)
-                    .collect::<String>(),
+                    rect.x as i32 + 3,
+                    rect.y as i32 + 6,
+                    &format!("{}{}", if window.minimized { "- " } else { "" }, title)
+                        .chars()
+                        .take(letters)
+                        .collect::<String>(),
                     0xffe1e9f5,
                     1,
                 );
@@ -162,7 +211,15 @@ impl DesktopUi for Shell {
             }
         }
     }
+    fn pointer_leave(&mut self, panel: usize) {
+        if panel == 1 {
+            self.dock_hover = None;
+        }
+    }
     fn pointer(&mut self, panel: usize, x: f64, y: f64, pressed: bool) {
+        if panel == 1 {
+            self.dock_hover = Some((x, y));
+        }
         if !pressed {
             return;
         }
@@ -188,22 +245,32 @@ impl DesktopUi for Shell {
                 None
             };
             mode.map(|m| Action::Control(format!("layout {m}")))
-        } else if y < 54.0 {
-            if x < 72.0 {
-                Some(Action::Launcher)
-            } else {
-                self.apps
-                    .get(((x - 76.0) / 104.0).max(0.0) as usize)
-                    .cloned()
-                    .map(Action::Launch)
-            }
-        } else if y < 88.0 {
-            self.runtime
-                .lock()
-                .unwrap()
-                .windows
-                .get(((x - 12.0) / 112.0).max(0.0) as usize)
-                .map(|w| Action::Control(format!("restore {}", w.id)))
+        } else if self
+            .dock_layout
+            .launcher
+            .is_some_and(|rect| rect.contains(x, y))
+        {
+            Some(Action::Launcher)
+        } else if let Some(item) = self
+            .dock_layout
+            .apps
+            .iter()
+            .find(|item| item.rect.contains(x, y))
+        {
+            self.drawn_apps
+                .get(item.index)
+                .filter(|app| self.apps.contains(app))
+                .cloned()
+                .map(Action::Launch)
+        } else if let Some(item) = self
+            .dock_layout
+            .windows
+            .iter()
+            .find(|item| item.rect.contains(x, y))
+        {
+            self.drawn_windows
+                .get(item.index)
+                .map(|id| Action::Control(format!("restore {id}")))
         } else {
             None
         };
@@ -226,13 +293,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let worker_state = runtime.clone();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
+        let (completed, results) = mpsc::sync_channel::<Result<String, String>>(4);
+        let mut pending = 0usize;
         loop {
+            while let Ok(result) = results.try_recv() {
+                pending = pending.saturating_sub(1);
+                worker_state.lock().unwrap().status =
+                    result.unwrap_or_else(|error| format!("Error: {error}"));
+            }
             match rx.recv_timeout(std::time::Duration::from_millis(500)) {
                 Ok(action) => {
                     let result = match action {
                         Action::Control(c) => ipc::control_command(&c),
                         Action::Launch(app) => {
-                            desktop::launch(&app).map(|_| format!("Started {}", app.name))
+                            if pending >= 4 {
+                                Err("Four applications are still starting; try again shortly"
+                                    .into())
+                            } else {
+                                let name = app.name.clone();
+                                let completed = completed.clone();
+                                match std::thread::Builder::new()
+                                    .name("aura-dock-launch".into())
+                                    .spawn(move || {
+                                        let result = desktop::launch(&app)
+                                            .map(|_| format!("Started {}", app.name));
+                                        let _ = completed.send(result);
+                                    }) {
+                                    Ok(_) => {
+                                        pending += 1;
+                                        Ok(format!("Starting {name}"))
+                                    }
+                                    Err(error) => Err(error.to_string()),
+                                }
+                            }
                         }
                         Action::Launcher => {
                             let sibling = std::env::current_exe()
@@ -290,12 +383,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             keyboard: KeyboardInteractivity::None,
         },
     ];
+    let mut catalog = DesktopCatalog::new()?;
+    let snapshot = catalog.snapshot();
     client::run(
         specs,
         Box::new(Shell {
             state,
             runtime,
-            apps: desktop::discover(),
+            apps: snapshot.entries.clone(),
+            drawn_apps: snapshot.entries,
+            drawn_windows: Vec::new(),
+            catalog,
+            catalog_revision: snapshot.revision,
+            dock_hover: None,
+            dock_layout: DockLayout::default(),
             actions: tx,
             redraw_fingerprint: None,
             menu_width: 0,

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Spotlight-style Liquid Glass fuzzy application launcher and command palette for Aura DE"
+description = "Liquid Glass application launcher and command palette for Aura DE"
 
 [[bin]]
 name = "aura-launcher"

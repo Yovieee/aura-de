@@ -1,5 +1,6 @@
 //! Keyboard-interactive XDG application launcher using an opaque SHM fallback.
 use aura_shell::{
+    catalog::DesktopCatalog,
     client::{self, Canvas, DesktopUi, PanelSpec},
     desktop::{self, DesktopEntryItem},
 };
@@ -215,20 +216,76 @@ fn parse_mode(args: &[String]) -> Result<Mode, &'static str> {
 }
 
 struct Launcher {
-    entries: Vec<DesktopEntryItem>,
+    entries: Arc<Vec<DesktopEntryItem>>,
+    catalog: DesktopCatalog,
+    catalog_revision: u64,
+    launch_result: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    launching: Option<String>,
+    completed: bool,
     query: String,
     selected: usize,
     error: Option<String>,
     reduced_transparency: bool,
 }
 impl DesktopUi for Launcher {
+    fn needs_redraw(&mut self) -> bool {
+        let snapshot = self.catalog.snapshot();
+        let mut changed = false;
+        if snapshot.revision != self.catalog_revision {
+            let selected_id = desktop::search(&self.entries, &self.query)
+                .get(self.selected)
+                .map(|entry| entry.app_id.clone());
+            self.entries = snapshot.entries;
+            self.catalog_revision = snapshot.revision;
+            let matches = desktop::search(&self.entries, &self.query);
+            self.selected = selected_id
+                .and_then(|id| matches.iter().take(8).position(|entry| entry.app_id == id))
+                .unwrap_or(0);
+            changed = true;
+        }
+        if let Some(receiver) = &self.launch_result {
+            let result = match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("Application launch worker stopped".into()))
+                }
+            };
+            if let Some(result) = result {
+                self.launch_result = None;
+                self.launching = None;
+                match result {
+                    Ok(()) => self.completed = true,
+                    Err(error) => self.error = Some(error),
+                }
+                changed = true;
+            }
+        }
+        changed
+    }
+    fn tick_interval(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_millis(100))
+    }
+    fn finished(&self) -> bool {
+        self.completed
+    }
     fn draw(&mut self, _: usize, c: &mut Canvas<'_>) {
         c.panel_background(0xff192534, self.reduced_transparency);
         c.rect(12, 12, c.width.saturating_sub(24), 38, 0xff2a3c51);
         c.text(24, 26, &format!("> {}_", self.query), 0xfff0f5fc, 1);
         let matches = desktop::search(&self.entries, &self.query);
         if matches.is_empty() {
-            c.text(24, 76, "No applications found", 0xffb1c2d9, 1);
+            c.text(
+                24,
+                76,
+                if self.catalog_revision == 0 {
+                    "Loading applications..."
+                } else {
+                    "No applications found"
+                },
+                0xffb1c2d9,
+                1,
+            );
         }
         for (i, entry) in matches.iter().take(8).enumerate() {
             let y = 64 + i as i32 * 30;
@@ -246,6 +303,14 @@ impl DesktopUi for Launcher {
         );
         if let Some(error) = &self.error {
             c.text(20, c.height as i32 - 18, error, 0xffff9e9e, 1);
+        } else if let Some(name) = &self.launching {
+            c.text(
+                20,
+                c.height as i32 - 18,
+                &format!("Starting {name}..."),
+                0xffb8c8dc,
+                1,
+            );
         }
     }
     fn key(&mut self, key: u32, text: Option<&str>) -> bool {
@@ -269,10 +334,24 @@ impl DesktopUi for Launcher {
             }
             0xff0d | 0xff8d => {
                 if let Some(entry) = desktop::search(&self.entries, &self.query).get(self.selected)
+                    && self.launch_result.is_none()
                 {
-                    match desktop::launch(entry) {
-                        Ok(()) => return true,
-                        Err(error) => self.error = Some(error),
+                    let entry = (*entry).clone();
+                    let name = entry.name.clone();
+                    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+                    match std::thread::Builder::new()
+                        .name("aura-app-launch".into())
+                        .spawn(move || {
+                            let _ = sender.send(desktop::launch(&entry));
+                        }) {
+                        Ok(_) => {
+                            self.launch_result = Some(receiver);
+                            self.launching = Some(name);
+                        }
+                        Err(error) => {
+                            self.error =
+                                Some(format!("Could not start application worker: {error}"))
+                        }
                     }
                 }
             }
@@ -330,8 +409,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         return result;
     }
-    let entries = desktop::discover();
     if let Mode::Search(query) = mode {
+        let entries = desktop::discover();
         for entry in desktop::search(&entries, &query) {
             println!("{}\t{}", entry.app_id, entry.name);
         }
@@ -346,10 +425,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         exclusive_zone: 0,
         keyboard: KeyboardInteractivity::Exclusive,
     };
+    let mut catalog = DesktopCatalog::new()?;
+    let snapshot = catalog.snapshot();
     client::run(
         vec![panel],
         Box::new(Launcher {
-            entries,
+            entries: snapshot.entries,
+            catalog,
+            catalog_revision: snapshot.revision,
+            launch_result: None,
+            launching: None,
+            completed: false,
             query: String::new(),
             selected: 0,
             error: None,
