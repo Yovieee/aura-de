@@ -23,6 +23,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Monitor ScreenCast transport using asynchronous PBO readback and actual PipeWire buffers, explicit consent, a sharing indicator/Stop action and request/session/disconnect cleanup.
 - Exact-pixel PipeWire transport and end-to-end consent/composed-frame test harnesses; CI explicitly exercises these and the driver-dependent PBO test.
 
+### Fixed
+
+- Make virtual-display startup honor the supplied environment, read complete displayfd responses, verify an actual X11 setup, retain startup diagnostics and clean up failed server/helper processes.
+
 ### Changed
 
 - Pin the development toolchain, retain application dependency locking, and add CI plus Debian/Ubuntu host setup instructions.

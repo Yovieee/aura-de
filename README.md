@@ -51,6 +51,7 @@ On Debian 13 without root access, `bash scripts/install-deps-user.sh --native --
 
 ```bash
 python3 scripts/verify_workspace.py
+python3 -m unittest discover -s scripts/tests -p test_xvfb.py -v
 cargo fmt --all -- --check
 cargo test -p aura-core --locked
 cargo check --workspace --all-targets --locked
@@ -71,7 +72,7 @@ python3 scripts/screencast_smoke.py --no-build
 
 The Python structure check verifies manifests and source paths only. Rust tests exercise the implementation. The nested smoke script runs a real Wayland SHM client and waits for configure/frame events; it creates Xvfb when no host display is available. The launcher/Dock check exercises live install/edit/remove updates, terminal argument handling, real D-Bus activation/fallback and magnified click targets; see [application launching](docs/application-launching.md). The desktop-controls check exercises notification action/close signals, acknowledged settings changes and keyboard layout shortcuts on a private bus/display. The window-render check verifies idle counters, glass-cache invalidation and real window-control input. The PipeWire fixture checks exact transported pixels; the separate ScreenCast check covers the actual compositor/consent/PipeWire path. See [capture and driver checks](docs/screencast.md) for explicit GPU tests and the meaning of each result.
 
-Mesa software rendering can validate the nested development path, but cannot validate a hardware DRM/KMS session or measure hardware performance. Each graphical script retains its logs under `target`; the window-render and ScreenCast checks also save `results.json` evidence.
+Mesa software rendering can validate the nested development path, but cannot validate a hardware DRM/KMS session or measure hardware performance. Xvfb startup is checked through an actual X11 connection, with stderr retained under `target/xvfb-logs`. Each graphical script retains its logs under `target`; the window-render and ScreenCast checks also save `results.json` evidence.
 
 ## Nested development
 

@@ -7,6 +7,9 @@ import os
 from pathlib import Path
 import select
 import shutil
+import signal
+import socket
+import struct
 import stat
 import subprocess
 import sys
@@ -27,29 +30,139 @@ def stop(process: subprocess.Popen | None) -> None:
         process.wait(timeout=5)
 
 
-def start_xvfb(environment: dict[str, str]) -> subprocess.Popen:
-    if shutil.which("Xvfb") is None:
-        raise RuntimeError("DISPLAY is unset and Xvfb is missing; install testing dependencies")
-    read_fd, write_fd = os.pipe()
-    process = subprocess.Popen(
-        ["Xvfb", "-displayfd", str(write_fd), "-screen", "0", "1280x720x24", "-nolisten", "tcp"],
-        pass_fds=(write_fd,), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    os.close(write_fd)
+def _read_xvfb_display(read_fd: int, process: subprocess.Popen, deadline: float) -> str:
+    """Read the complete displayfd line, noticing process death even without EOF."""
+    os.set_blocking(read_fd, False)
+    response = bytearray()
+    while True:
+        code = process.poll()
+        if code is not None:
+            raise RuntimeError(f"Xvfb exited before reporting a display (exit {code})")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("Xvfb did not report a display before the startup deadline")
+        if not select.select([read_fd], [], [], min(remaining, 0.1))[0]:
+            continue
+        chunk = os.read(read_fd, 64)
+        if not chunk:
+            raise RuntimeError(f"Xvfb closed displayfd before readiness (exit {process.poll()})")
+        response.extend(chunk)
+        if len(response) > 32:
+            raise RuntimeError("Xvfb reported an oversized displayfd response")
+        if b"\n" in response:
+            line = bytes(response).split(b"\n", 1)[0]
+            if not line or any(byte < 48 or byte > 57 for byte in line) or int(line) > 65535:
+                raise RuntimeError(f"Xvfb reported an invalid display number: {line!r}")
+            return line.decode('ascii')
+
+
+def _wait_x11(display: str, process: subprocess.Popen, deadline: float) -> None:
+    """Require a successful X11 setup response, not just a PID or socket file."""
+    last_error = 'no connection attempt'
+    while time.monotonic() < deadline:
+        code = process.poll()
+        if code is not None:
+            raise RuntimeError(f"Xvfb exited while waiting for X11 readiness (exit {code})")
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(min(0.2, max(0.001, deadline - time.monotonic())))
+                connection.connect(f'/tmp/.X11-unix/X{display}')
+                connection.sendall(struct.pack('<BBHHHHH', ord('l'), 0, 11, 0, 0, 0, 0))
+                def receive(length):
+                    result = bytearray()
+                    while len(result) < length:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError('X11 setup deadline exceeded')
+                        connection.settimeout(min(0.2, remaining))
+                        chunk = connection.recv(length - len(result))
+                        if not chunk:
+                            raise OSError('X11 closed an incomplete setup response')
+                        result.extend(chunk)
+                    return result
+                header = receive(8)
+                status, reason_length, major, _, units = struct.unpack('<BBHHH', header)
+                setup = receive(units * 4)
+                if status != 1:
+                    reason = bytes(setup[:reason_length]).decode('utf-8', errors='replace')
+                    raise RuntimeError(f'Xvfb rejected X11 setup (status {status}): {reason}')
+                if major != 11 or len(setup) < 32 or setup[20] == 0:
+                    raise RuntimeError('Xvfb returned an invalid X11 setup response')
+                return
+        except OSError as error:
+            last_error = str(error)
+            time.sleep(min(0.02, max(0, deadline - time.monotonic())))
+    raise RuntimeError(f'Xvfb did not accept an X11 setup before the startup deadline: {last_error}')
+
+
+def _stop_failed_xvfb(process: subprocess.Popen | None) -> None:
+    if process is None:
+        return
+    # This process starts in its own session. Also stop initialization helpers
+    # that may retain displayfd after the server itself has already exited.
     try:
-        if not select.select([read_fd], [], [], 10)[0]:
-            raise RuntimeError("Xvfb did not report a display within 10 seconds")
-        display = os.read(read_fd, 64).decode().strip()
-        if not display.isdigit() or process.poll() is not None:
-            raise RuntimeError("Xvfb failed to initialize")
-        environment["DISPLAY"] = f":{display}"
-        environment.pop("WAYLAND_DISPLAY", None)
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+    # The parent may have exited while a helper still retains displayfd.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=1)
+
+
+def start_xvfb(environment: dict[str, str], *, timeout: float = 30,
+               log_dir: Path | None = None) -> subprocess.Popen:
+    program = shutil.which('Xvfb', path=environment.get('PATH'))
+    if program is None:
+        raise RuntimeError('Xvfb is missing; install testing dependencies')
+    if timeout <= 0 or not timeout < float('inf'):
+        raise ValueError('Xvfb startup timeout must be positive and finite')
+    log_dir = log_dir if log_dir is not None else ROOT / 'target' / 'xvfb-logs'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f'xvfb-{os.getpid()}-{time.monotonic_ns()}.log'
+    read_fd = write_fd = None
+    process = None
+    start = time.monotonic()
+    try:
+        read_fd, write_fd = os.pipe()
+        with log_path.open('xb') as log:
+            process = subprocess.Popen(
+                [program, '-displayfd', str(write_fd), '-screen', '0', '1280x720x24',
+                 '-nolisten', 'tcp', '-noreset'],
+                pass_fds=(write_fd,), env=environment, start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=log,
+            )
+        os.close(write_fd)
+        write_fd = None
+        deadline = start + timeout
+        display = _read_xvfb_display(read_fd, process, deadline)
+        _wait_x11(display, process, deadline)
+        if process.poll() is not None:
+            raise RuntimeError(f'Xvfb exited during readiness (exit {process.returncode})')
+        environment['DISPLAY'] = f':{display}'
+        environment.pop('WAYLAND_DISPLAY', None)
         return process
-    except Exception:
-        stop(process)
-        raise
+    except BaseException as error:
+        _stop_failed_xvfb(process)
+        if not isinstance(error, Exception):
+            raise
+        code = None if process is None else process.returncode
+        diagnostic = tail(log_path)
+        raise RuntimeError(
+            f'{error}; Xvfb exit={code}, elapsed={time.monotonic() - start:.2f}s; '
+            f'log: {log_path}\n{diagnostic or "(no Xvfb stderr)"}'
+        ) from error
     finally:
-        os.close(read_fd)
+        if write_fd is not None:
+            os.close(write_fd)
+        if read_fd is not None:
+            os.close(read_fd)
 
 
 def tail(path: Path) -> str:

@@ -29,6 +29,7 @@ Checks ran on Debian 13, Rust 1.99.1, Mesa 25.0.7 llvmpipe and PipeWire 1.4.2. R
 
 | Command or check | Result |
 | --- | --- |
+| `python3 -m unittest discover -s scripts/tests -p test_xvfb.py -v` | 9 passed; actual Xlib connection, startup errors/timeouts, partial display reports, environment forwarding, descriptor cleanup and failed helper-process teardown |
 | `python3 scripts/verify_workspace.py` | Passed structural checks; no mathematical/runtime claim is inferred from this script |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo check --workspace --all-targets --all-features --locked` | Passed; optional native feature means dependency compilation, not a hardware backend |
@@ -73,3 +74,9 @@ Other logs are retained in `target/smoke-logs`, `target/desktop-smoke-logs` and 
 5. Validate multioutput, suspend/resume, VT switching and installation on target machines before calling this a native alpha desktop release.
 
 Reusable cloud install/start instructions have been saved to the configuration draft. Publication of a new snapshot, a remote CI run and validation in a fresh task are separate operations and are not claimed here.
+
+## Virtual display startup diagnostics
+
+The reported GitHub Actions run timed out before Xvfb supplied a display number, before compositor startup. The old helper discarded server stderr, so that log does not establish the underlying cause. Startup now has a shared 30-second monotonic deadline, notices early process exit, reads the complete displayfd line, and requires a successful X11 setup before publishing `DISPLAY`. Failed startups stop their owned initialization processes and preserve stderr, elapsed time and exit status. Logs under `target/xvfb-logs` are uploaded even when CI fails early.
+
+Independent checks on Ubuntu 24.04 with Xvfb `2:21.1.12-1ubuntu1.9` passed five sequential and four concurrent startups for both the original and updated helper. The updated helper also passed X11 setup and `xdpyinfo` checks. This does not reproduce or explain the original GitHub timeout; the next remote run is needed to establish its result.
