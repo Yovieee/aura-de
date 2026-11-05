@@ -5,3 +5,6 @@ pub mod client;
 pub mod desktop;
 pub mod dock;
 pub mod ipc;
+pub mod settings;
+
+pub mod notifications;

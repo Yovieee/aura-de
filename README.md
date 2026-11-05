@@ -2,7 +2,7 @@
 
 Aura DE is an experimental Linux desktop written in Rust, with a Wayland compositor and a graphical shell. The workspace separates pure layout/animation models, rendering, compositor, shell, launcher, and session management into six crates.
 
-This is a nested, single-output development desktop. It includes Wayland client lifecycle and input handling, negotiated server-side window controls, fullscreen policy, layer-shell panels and an XDG application launcher. The launcher and Dock refresh installed applications automatically, support terminal commands and D-Bus activation, and magnify Dock app tiles under the pointer. Glass rendering retains the scene/blur textures and skips unchanged frames. ScreenCast exports an approved monitor source through real PipeWire buffers; its integration gate and current limits are recorded in [implementation status](docs/implementation-status.md).
+This is a nested, single-output development desktop. It includes Wayland client lifecycle and input handling, negotiated server-side window controls, fullscreen policy, layer-shell panels and an XDG application launcher. The launcher and Dock refresh installed applications automatically, support terminal commands and D-Bus activation, and magnify Dock app tiles under the pointer. Glass rendering retains the scene/blur textures and skips unchanged frames. Session controls include notification actions and a settings panel for window layout, glass quality and Do Not Disturb. ScreenCast exports an approved monitor source through real PipeWire buffers; its integration gate and current limits are recorded in [implementation status](docs/implementation-status.md).
 
 This is development software, with no claim of a working native DRM/KMS session. ScreenCast is limited to a single monitor, hidden cursor and fixed-size SDR RGBA frames, at most 4096 pixels per axis. Resizing ends the stream and requires fresh selection/consent. Hardware performance, zero-copy capture, HDR and multioutput are not established.
 
@@ -21,6 +21,10 @@ Captured from a running nested session with Mesa software rendering. The windows
 **Screen sharing consent, with Deny selected by default**
 
 ![Aura ScreenCast consent dialog showing the requesting application and Deny and Allow buttons](docs/screenshots/screencast-consent.png)
+
+**Desktop layout, glass quality, and notification settings**
+
+![Aura desktop settings showing layout, glass quality and Do Not Disturb controls](docs/screenshots/desktop-settings.png)
 
 ## Build on Linux
 
@@ -59,12 +63,13 @@ python3 scripts/smoke_nested.py --no-build --software
 python3 scripts/integration_desktop.py --no-build --software
 python3 scripts/session_smoke.py --no-build
 python3 scripts/launcher_dock_smoke.py --no-build
+python3 scripts/desktop_controls_smoke.py --no-build
 python3 scripts/window_render_smoke.py --no-build
 python3 crates/aura-session/tests/pipewire_roundtrip.py
 python3 scripts/screencast_smoke.py --no-build
 ```
 
-The Python structure check verifies manifests and source paths only. Rust tests exercise the implementation. The nested smoke script runs a real Wayland SHM client and waits for configure/frame events; it creates Xvfb when no host display is available. The launcher/Dock check exercises live install/edit/remove updates, terminal argument handling, real D-Bus activation/fallback and magnified click targets; see [application launching](docs/application-launching.md). The window-render check verifies idle counters, glass-cache invalidation and real window-control input. The PipeWire fixture checks exact transported pixels; the separate ScreenCast check covers the actual compositor/consent/PipeWire path. See [capture and driver checks](docs/screencast.md) for explicit GPU tests and the meaning of each result.
+The Python structure check verifies manifests and source paths only. Rust tests exercise the implementation. The nested smoke script runs a real Wayland SHM client and waits for configure/frame events; it creates Xvfb when no host display is available. The launcher/Dock check exercises live install/edit/remove updates, terminal argument handling, real D-Bus activation/fallback and magnified click targets; see [application launching](docs/application-launching.md). The desktop-controls check exercises notification action/close signals, acknowledged settings changes and keyboard layout shortcuts on a private bus/display. The window-render check verifies idle counters, glass-cache invalidation and real window-control input. The PipeWire fixture checks exact transported pixels; the separate ScreenCast check covers the actual compositor/consent/PipeWire path. See [capture and driver checks](docs/screencast.md) for explicit GPU tests and the meaning of each result.
 
 Mesa software rendering can validate the nested development path, but cannot validate a hardware DRM/KMS session or measure hardware performance. Each graphical script retains its logs under `target`; the window-render and ScreenCast checks also save `results.json` evidence.
 
@@ -87,6 +92,8 @@ The compositor's host display and its server socket are distinct: keep the host 
 
 Use the supervised session and an available PipeWire daemon for ScreenCast. An application request opens an explicit consent overlay, which defaults to denial. The shell indicates active sharing and provides Stop; stop, session close, frontend disconnect or source loss removes the stream. Standalone `aura-session --portal` does not acquire the supervisor's capture capability. See [ScreenCast scope and lifecycle](docs/screencast.md).
 
+Open **Settings** from the menu bar, or run `WAYLAND_DISPLAY=wayland-aura-0 cargo run --locked -p aura-shell --bin aura-settings` on the same session bus. Layout, glass quality and Do Not Disturb settings apply to the current session; they are not persisted. Keyboard layout controls are `Super+Up` (Stage Manager), `Super+Down` (Floating), and `Super+Left`/`Super+Right` (toggle Tiling/Floating). The gesture lifecycle is wired for input backends that provide raw swipes, but the current nested winit backend does not emit them; physical touchpad support is not claimed. See [desktop controls](docs/desktop-controls.md).
+
 `.env.example` lists supported development settings; environment files are not loaded automatically. Export settings in your shell when needed. The compositor is the authority for window layout and backdrop capture; a normal Wayland client does not automatically receive other clients' pixels for blur.
 
 ## Stage a development package
@@ -95,7 +102,7 @@ Use the supervised session and an available PipeWire daemon for ScreenCast. An a
 bash scripts/install.sh --prefix /usr --destdir /tmp/aura-package
 ```
 
-This builds and stages binaries, documentation and licenses without starting a session or replacing desktop services. Optional `--with-session` installs a nested-preview session descriptor; it is not a bare-metal display-manager session. Optional `--with-portal` installs backend activation metadata. Descriptors alone do not create a supervised capture source, a PipeWire daemon or application consent. See [data/README.md](data/README.md).
+This builds and stages binaries (including `aura-settings`), its application entry, documentation and licenses without starting a session or replacing desktop services. Optional `--with-session` installs a nested-preview session descriptor; it is not a bare-metal display-manager session. Optional `--with-portal` installs backend activation metadata. Descriptors alone do not create a supervised capture source, a PipeWire daemon or application consent. See [data/README.md](data/README.md).
 
 ## Workspace
 

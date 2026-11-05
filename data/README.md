@@ -35,3 +35,12 @@ alone does not create a supervised source, daemon or user consent. See
 To test activation on a desktop host, install descriptors to a user or system
 XDG data directory and run `aura-session --portal` on a private session bus. Do not
 replace or restart a user's existing desktop portal as part of automated setup.
+
+## Settings application entry
+
+The standard development install includes `aura-settings` and
+`share/applications/org.aura.Settings.desktop`. The entry is shown in an Aura
+session and launches controls for the current session's layout, glass quality
+and Do Not Disturb state. It needs the running compositor and `org.aura.Shell1`
+on the same session bus. It does not configure system hardware or persist
+preferences across session restarts. See `docs/desktop-controls.md`.

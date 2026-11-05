@@ -37,9 +37,20 @@ pub struct PanelSpec {
     pub keyboard: KeyboardInteractivity,
 }
 
+/// An optional role created only while requested by the UI, keyed by namespace.
+pub struct SupplementalPanel {
+    /// A new logical request can reopen a role previously closed by the compositor.
+    pub revision: u64,
+    pub spec: PanelSpec,
+    pub margins: (i32, i32, i32, i32),
+}
+
 /// Minimal event-driven UI contract. Return true from a key handler to exit.
 pub trait DesktopUi {
     fn draw(&mut self, panel: usize, canvas: &mut Canvas<'_>);
+    fn supplemental_panels(&self) -> Vec<SupplementalPanel> {
+        Vec::new()
+    }
     fn key(&mut self, _keysym: u32, _text: Option<&str>) -> bool {
         false
     }
@@ -133,6 +144,8 @@ impl Canvas<'_> {
     }
 }
 struct Panel {
+    namespace: &'static str,
+    revision: u64,
     layer: LayerSurface,
     width: u32,
     height: u32,
@@ -144,6 +157,10 @@ struct Panel {
 }
 struct Client {
     registry: RegistryState,
+    compositor: CompositorState,
+    layer_shell: LayerShell,
+    base_panel_count: usize,
+    closed_supplemental: std::collections::HashMap<&'static str, u64>,
     seat: SeatState,
     outputs: OutputState,
     shm: Shm,
@@ -181,6 +198,8 @@ pub fn run(
             layer.set_exclusive_zone(spec.exclusive_zone);
             layer.commit();
             Panel {
+                namespace: spec.namespace,
+                revision: 0,
                 layer,
                 width: spec.width.max(1),
                 height: spec.height.max(1),
@@ -194,6 +213,10 @@ pub fn run(
         .collect();
     let mut state = Client {
         registry: RegistryState::new(&globals),
+        compositor,
+        layer_shell: shell,
+        base_panel_count: panel_count,
+        closed_supplemental: std::collections::HashMap::new(),
         seat: SeatState::new(&globals, &qh),
         outputs: OutputState::new(&globals, &qh),
         shm,
@@ -226,6 +249,7 @@ pub fn run(
                 panel.dirty = true;
             }
         }
+        state.sync_supplemental_panels(&qh);
         if !state.exit && !state.ui.finished() {
             for index in 0..state.panels.len() {
                 state.draw(index, &qh);
@@ -235,6 +259,72 @@ pub fn run(
     Ok(())
 }
 impl Client {
+    fn sync_supplemental_panels(&mut self, qh: &QueueHandle<Self>) {
+        let desired = self.ui.supplemental_panels();
+        self.closed_supplemental.retain(|namespace, revision| {
+            desired
+                .iter()
+                .any(|panel| panel.spec.namespace == *namespace && panel.revision == *revision)
+        });
+        for index in (self.base_panel_count..self.panels.len()).rev() {
+            if !desired
+                .iter()
+                .any(|panel| panel.spec.namespace == self.panels[index].namespace)
+            {
+                let panel = self.panels.remove(index);
+                self.frames.remove(index);
+                panel.layer.wl_surface().attach(None, 0, 0);
+                panel.layer.commit();
+                drop(panel);
+            }
+        }
+        for panel in desired {
+            let spec = panel.spec;
+            if let Some(existing) = self
+                .panels
+                .iter_mut()
+                .find(|existing| existing.namespace == spec.namespace)
+            {
+                existing.revision = panel.revision;
+                continue;
+            }
+            if self.closed_supplemental.get(spec.namespace) == Some(&panel.revision) {
+                continue;
+            }
+            let surface = self.compositor.create_surface(qh);
+            let layer = self.layer_shell.create_layer_surface(
+                qh,
+                surface,
+                spec.layer,
+                Some(spec.namespace),
+                None,
+            );
+            layer.set_anchor(spec.anchor);
+            layer.set_size(spec.width, spec.height);
+            layer.set_keyboard_interactivity(spec.keyboard);
+            layer.set_exclusive_zone(spec.exclusive_zone);
+            layer.set_margin(
+                panel.margins.0,
+                panel.margins.1,
+                panel.margins.2,
+                panel.margins.3,
+            );
+            layer.commit();
+            self.panels.push(Panel {
+                namespace: spec.namespace,
+                revision: panel.revision,
+                layer,
+                width: spec.width.max(1),
+                height: spec.height.max(1),
+                scale: 1,
+                configured: false,
+                dirty: true,
+                frame_pending: false,
+                last_draw: None,
+            });
+            self.frames.push(0);
+        }
+    }
     fn redraw_delay(&self) -> Option<Duration> {
         self.panels
             .iter()
@@ -378,8 +468,17 @@ impl OutputHandler for Client {
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
 impl LayerShellHandler for Client {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        self.exit = true;
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
+        if let Some(index) = self.panels.iter().position(|panel| panel.layer == *layer) {
+            if index < self.base_panel_count {
+                self.exit = true;
+            } else {
+                let panel = self.panels.remove(index);
+                self.frames.remove(index);
+                self.closed_supplemental
+                    .insert(panel.namespace, panel.revision);
+            }
+        }
     }
     fn configure(
         &mut self,

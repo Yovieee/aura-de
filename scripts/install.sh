@@ -35,21 +35,23 @@ done
 [[ "$profile" == release || "$profile" == dev ]] || { echo "--profile must be release or dev" >&2; exit 2; }
 cd "$repository_root"
 if "$build"; then
-    cargo build --workspace --locked --profile "$profile"
+    cargo build --workspace --bins --locked --profile "$profile"
 fi
 target_directory="${CARGO_TARGET_DIR:-$repository_root/target}"
 binary_directory="$target_directory/$profile"
 [[ "$profile" != dev ]] || binary_directory="$target_directory/debug"
 destination="${staging_root}${prefix%/}"
-for binary in aura-compositor aura-shell aura-launcher aura-session; do
+for binary in aura-compositor aura-shell aura-launcher aura-settings aura-session; do
     [[ -x "$binary_directory/$binary" ]] || { echo "Missing built executable: $binary_directory/$binary" >&2; exit 1; }
 done
 install -d "$destination/bin" "$destination/share/licenses/aura-de" "$destination/share/doc/aura-de"
-for binary in aura-compositor aura-shell aura-launcher aura-session; do
+for binary in aura-compositor aura-shell aura-launcher aura-settings aura-session; do
     install -m 755 "$binary_directory/$binary" "$destination/bin/$binary"
 done
 install -m 644 LICENSE-MIT LICENSE-APACHE "$destination/share/licenses/aura-de/"
-install -m 644 README.md docs/implementation-status.md "$destination/share/doc/aura-de/"
+install -m 644 README.md docs/implementation-status.md docs/desktop-controls.md "$destination/share/doc/aura-de/"
+install -d "$destination/share/applications"
+install -m 644 data/applications/org.aura.Settings.desktop "$destination/share/applications/"
 if "$with_session"; then
     install -d "$destination/share/wayland-sessions"
     install -m 644 data/wayland-sessions/aura.desktop "$destination/share/wayland-sessions/"

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Aura Settings
+Comment=Adjust the current Aura session's desktop controls
+Exec=aura-settings
+TryExec=aura-settings
+Icon=preferences-desktop
+Terminal=false
+Categories=Settings;DesktopSettings;
+OnlyShowIn=Aura;
+Keywords=layout;glass;notifications;preferences;

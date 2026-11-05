@@ -5,6 +5,7 @@ use aura_shell::{
     desktop::{self, DesktopEntryItem},
     dock::{self, DockLayout},
     ipc::{self, SharedState},
+    notifications::{self, Hit},
 };
 use smithay_client_toolkit::shell::wlr_layer::{Anchor, KeyboardInteractivity, Layer};
 use std::sync::{Arc, Mutex, mpsc};
@@ -30,6 +31,7 @@ enum Action {
     Control(String),
     Launch(DesktopEntryItem),
     Launcher,
+    Settings,
 }
 struct Shell {
     state: SharedState,
@@ -44,6 +46,11 @@ struct Shell {
     actions: mpsc::Sender<Action>,
     redraw_fingerprint: Option<u64>,
     menu_width: u32,
+    settings_rect: Option<dock::Rect>,
+    notification_key: Option<(u32, u64)>,
+    notification_page: usize,
+    drawn_notification: Option<ipc::Notification>,
+    drawn_notification_page: usize,
 }
 impl DesktopUi for Shell {
     fn needs_redraw(&mut self) -> bool {
@@ -53,6 +60,7 @@ impl DesktopUi for Shell {
         self.catalog_revision = snapshot.revision;
         let mut hash = DefaultHasher::new();
         self.catalog_revision.hash(&mut hash);
+        self.notification_page.hash(&mut hash);
         self.dock_hover
             .map(|(x, y)| (x.to_bits(), y.to_bits()))
             .hash(&mut hash);
@@ -62,7 +70,24 @@ impl DesktopUi for Shell {
             state.do_not_disturb.hash(&mut hash);
             state.notifications.len().hash(&mut hash);
             if let Some(notification) = state.notifications.values().next_back() {
-                (&notification.app, &notification.summary, &notification.body).hash(&mut hash);
+                (
+                    &notification.app,
+                    &notification.summary,
+                    &notification.body,
+                    notification.generation,
+                )
+                    .hash(&mut hash);
+                for action in &notification.actions {
+                    (&action.key, &action.label).hash(&mut hash);
+                }
+                let key = Some((notification.id, notification.generation));
+                if self.notification_key != key {
+                    self.notification_key = key;
+                    self.notification_page = 0;
+                }
+            } else {
+                self.notification_key = None;
+                self.notification_page = 0;
             }
         }
         {
@@ -88,7 +113,35 @@ impl DesktopUi for Shell {
     fn tick_interval(&self) -> Option<std::time::Duration> {
         Some(std::time::Duration::from_millis(100))
     }
+    fn supplemental_panels(&self) -> Vec<client::SupplementalPanel> {
+        let state = self.state.lock().unwrap();
+        if state.do_not_disturb || state.notifications.is_empty() {
+            Vec::new()
+        } else {
+            let revision = state.notifications.values().next_back().unwrap().generation;
+            vec![notifications::panel(revision)]
+        }
+    }
     fn draw(&mut self, panel: usize, c: &mut Canvas<'_>) {
+        if panel == 2 {
+            self.drawn_notification = self
+                .state
+                .lock()
+                .unwrap()
+                .notifications
+                .values()
+                .next_back()
+                .cloned();
+            if let Some(notification) = &self.drawn_notification {
+                self.drawn_notification_page = self
+                    .notification_page
+                    .min(notifications::pages(notification) - 1);
+                notifications::draw(notification, self.drawn_notification_page, c);
+            } else {
+                c.clear(0);
+            }
+            return;
+        }
         let reduced = self.state.lock().unwrap().reduced_transparency;
         c.panel_background(0xff182230, reduced);
         if panel == 0 {
@@ -114,6 +167,23 @@ impl DesktopUi for Shell {
                 0xffb8c8dc,
                 1,
             );
+            let settings_x = c.width.saturating_sub(if sharing { 492 } else { 292 });
+            self.settings_rect = (settings_x >= 372).then_some(dock::Rect {
+                x: settings_x as f32,
+                y: 4.,
+                width: 104.,
+                height: 24.,
+            });
+            if let Some(rect) = self.settings_rect {
+                c.rect(
+                    rect.x as i32,
+                    rect.y as i32,
+                    rect.width as u32,
+                    rect.height as u32,
+                    0xff2a3c51,
+                );
+                c.text(rect.x as i32 + 12, 12, "Settings", 0xffedf3fc, 1);
+            }
             if sharing {
                 let x = c.width.saturating_sub(192) as i32;
                 c.rect(x, 4, 184, 24, 0xffa12835);
@@ -223,7 +293,39 @@ impl DesktopUi for Shell {
         if !pressed {
             return;
         }
+        if panel == 2 {
+            if let Some(notification) = &self.drawn_notification
+                && self.notification_key == Some((notification.id, notification.generation))
+            {
+                match notifications::hit(notification, self.drawn_notification_page, x, y) {
+                    Some(Hit::Action(key)) => {
+                        ipc::enqueue_action(
+                            &self.state,
+                            notification.id,
+                            notification.generation,
+                            &key,
+                        );
+                    }
+                    Some(Hit::Dismiss) => {
+                        ipc::enqueue_dismiss(&self.state, notification.id, notification.generation);
+                    }
+                    Some(Hit::Previous) => {
+                        self.notification_page = self.drawn_notification_page.saturating_sub(1)
+                    }
+                    Some(Hit::Next) => {
+                        self.notification_page = (self.drawn_notification_page + 1)
+                            .min(notifications::pages(notification) - 1)
+                    }
+                    None => {}
+                }
+            }
+            return;
+        }
         let action = if panel == 0 {
+            if self.settings_rect.is_some_and(|rect| rect.contains(x, y)) {
+                let _ = self.actions.send(Action::Settings);
+                return;
+            }
             if self.runtime.lock().unwrap().sharing > 0
                 && (f64::from(self.menu_width.saturating_sub(192))
                     ..f64::from(self.menu_width.saturating_sub(8)))
@@ -279,6 +381,22 @@ impl DesktopUi for Shell {
         }
     }
 }
+fn open_panel(name: &str) -> Result<String, String> {
+    let program = std::env::current_exe()
+        .ok()
+        .map(|path| path.with_file_name(name))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| name.into());
+    std::process::Command::new(program)
+        .spawn()
+        .map(|mut child| {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            format!("{name} opened")
+        })
+        .map_err(|error| error.to_string())
+}
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -327,23 +445,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
-                        Action::Launcher => {
-                            let sibling = std::env::current_exe()
-                                .ok()
-                                .map(|p| p.with_file_name("aura-launcher"));
-                            let program = sibling
-                                .filter(|p| p.is_file())
-                                .unwrap_or_else(|| "aura-launcher".into());
-                            std::process::Command::new(program)
-                                .spawn()
-                                .map(|mut child| {
-                                    std::thread::spawn(move || {
-                                        let _ = child.wait();
-                                    });
-                                    "Launcher opened".into()
-                                })
-                                .map_err(|e| e.to_string())
-                        }
+                        Action::Launcher => open_panel("aura-launcher"),
+                        Action::Settings => open_panel("aura-settings"),
                     };
                     worker_state.lock().unwrap().status =
                         result.unwrap_or_else(|e| format!("Error: {e}"));
@@ -400,6 +503,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             actions: tx,
             redraw_fingerprint: None,
             menu_width: 0,
+            settings_rect: None,
+            notification_key: None,
+            notification_page: 0,
+            drawn_notification: None,
+            drawn_notification_page: 0,
         }),
     )
 }
