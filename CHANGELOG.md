@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Notification action cards with paged buttons, resident behavior, generation checks and action/close signals directed to the originating application.
+- Session-scoped `aura-settings` controls for layout, glass quality and Do Not Disturb, packaged with an Aura application entry.
+- Validated swipe-lifecycle dispatch and nested-backend `Super+Arrow` layout shortcuts; the current winit backend does not supply physical swipe events.
 - Terminal desktop entries and bounded `org.freedesktop.Application.Activate` with shell-free Exec fallback; launcher activation runs on a worker.
 - Live application discovery for open launchers and the Dock, preserving user overrides and Hidden masking.
 - Pointer-driven Dock magnification, matching pixel drawing/hit geometry, leave reset and real input/activation regression coverage.
@@ -19,6 +22,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Event-driven output redraw, retained scene/blur caches and counter-based idle/cache integration checks.
 - Monitor ScreenCast transport using asynchronous PBO readback and actual PipeWire buffers, explicit consent, a sharing indicator/Stop action and request/session/disconnect cleanup.
 - Exact-pixel PipeWire transport and end-to-end consent/composed-frame test harnesses; CI explicitly exercises these and the driver-dependent PBO test.
+
+### Fixed
+
+- Make virtual-display startup honor the supplied environment, read complete displayfd responses, verify an actual X11 setup, retain startup diagnostics and clean up failed server/helper processes.
 
 ### Changed
 

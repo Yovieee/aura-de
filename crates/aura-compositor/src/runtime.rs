@@ -6,15 +6,21 @@ use crate::{
     glass::{GlassPanel, GlassRenderer},
     scene::SceneElement,
 };
-use aura_compositor::state::AuraCompositorState;
+use aura_compositor::{
+    input::{
+        LayoutShortcut, LayoutShortcutState, SwipeGestureState, TouchpadSwipeGesture,
+        layout_mode_for_gesture,
+    },
+    state::AuraCompositorState,
+};
 use aura_core::{GlassQualityPreset, LayoutMode, Rect, TrafficLightAction, WindowStateFlags};
 use smithay::wayland::shell::xdg::SurfaceCachedState as XdgSurfaceCachedState;
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::{
     backend::{
         input::{
-            AbsolutePositionEvent, Axis, ButtonState, Event, InputEvent, KeyboardKeyEvent,
-            PointerAxisEvent, PointerButtonEvent,
+            AbsolutePositionEvent, Axis, ButtonState, Event, InputBackend, InputEvent,
+            KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
         },
         renderer::{
             Color32F, Frame, Renderer,
@@ -130,6 +136,9 @@ struct App {
     popups: PopupManager,
     pointer: Point<f64, Logical>,
     drag: Option<Drag>,
+    swipe: SwipeGestureState,
+    layout_shortcut_keys: LayoutShortcutState,
+    host_focused: bool,
     scale: i32,
     glass_ready: bool,
     frame_dirty: bool,
@@ -143,6 +152,43 @@ struct App {
 }
 
 impl App {
+    fn host_focus_changed(&mut self, focused: bool, time: u32) {
+        if self.host_focused == focused {
+            return;
+        }
+        self.host_focused = focused;
+        if focused {
+            self.sync_focus();
+            return;
+        }
+        // Winit's synthetic releases are intentionally filtered by Smithay.
+        // Clear both XKB and forwarded-key state before returning focus, so a
+        // modifier released outside the nested window cannot trigger shortcuts.
+        let keyboard = self.seat.get_keyboard().unwrap();
+        keyboard.unset_grab(self);
+        keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+        for code in keyboard.pressed_keys() {
+            keyboard.input::<(), _>(
+                self,
+                code,
+                smithay::backend::input::KeyState::Released,
+                SERIAL_COUNTER.next_serial(),
+                time,
+                |_, _, _| FilterResult::Forward,
+            );
+        }
+        self.layout_shortcut_keys = LayoutShortcutState::default();
+        self.swipe = SwipeGestureState::default();
+        self.drag = None;
+    }
+    fn apply_layout_gesture(&mut self, gesture: TouchpadSwipeGesture) {
+        let mode = layout_mode_for_gesture(self.model.workspace.mode, gesture);
+        if mode != self.model.workspace.mode {
+            self.model.set_layout_mode(mode);
+            self.configure_windows();
+            self.frame_dirty = true;
+        }
+    }
     fn id(&self, surface: &ToplevelSurface) -> Option<u64> {
         self.toplevels
             .iter()
@@ -343,7 +389,11 @@ impl App {
                 self.toplevels.push(top);
                 self.seat.get_keyboard().unwrap().set_focus(
                     self,
-                    self.exclusive_layer().or(Some(surface)),
+                    if self.host_focused {
+                        self.exclusive_layer().or(Some(surface))
+                    } else {
+                        None
+                    },
                     SERIAL_COUNTER.next_serial(),
                 );
             }
@@ -364,7 +414,11 @@ impl App {
             .map(|t| t.surface.wl_surface().clone());
         self.seat.get_keyboard().unwrap().set_focus(
             self,
-            self.exclusive_layer().or(surface),
+            if self.host_focused {
+                self.exclusive_layer().or(surface)
+            } else {
+                None
+            },
             SERIAL_COUNTER.next_serial(),
         );
         self.configure_windows();
@@ -1080,6 +1134,9 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
         popups: PopupManager::default(),
         pointer: (0., 0.).into(),
         drag: None,
+        swipe: SwipeGestureState::default(),
+        layout_shortcut_keys: LayoutShortcutState::default(),
+        host_focused: true,
         scale: config.scale,
         glass_ready: false,
         frame_dirty: true,
@@ -1149,8 +1206,10 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
                 app.frame_dirty = true;
             }
             WinitEvent::Input(event) => handle_input(&mut app, event),
+            WinitEvent::Focus(focused) => {
+                app.host_focus_changed(focused, start.elapsed().as_millis() as u32)
+            }
             WinitEvent::CloseRequested => app.model.should_exit = true,
-            _ => {}
         });
         if matches!(status, ::winit::platform::pump_events::PumpStatus::Exit(_)) {
             break;
@@ -1482,7 +1541,10 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn handle_input(app: &mut App, event: InputEvent<smithay::backend::winit::WinitInput>) {
+fn handle_input<B: InputBackend>(app: &mut App, event: InputEvent<B>) {
+    if let Some(gesture) = app.swipe.process(&event) {
+        app.apply_layout_gesture(gesture);
+    }
     match event {
         InputEvent::Keyboard { event } => {
             let keyboard = app.seat.get_keyboard().unwrap();
@@ -1493,6 +1555,21 @@ fn handle_input(app: &mut App, event: InputEvent<smithay::backend::winit::WinitI
                 SERIAL_COUNTER.next_serial(),
                 event.time_msec(),
                 |app, mods, key| {
+                    // Nested winit does not expose raw touchpad gestures. These
+                    // keyboard alternatives use the same committed layout action.
+                    match app.layout_shortcut_keys.process(
+                        event.key_code().raw(),
+                        key.modified_sym().raw(),
+                        event.state() == smithay::backend::input::KeyState::Pressed,
+                        mods.logo && !mods.ctrl && !mods.alt && !mods.shift,
+                    ) {
+                        LayoutShortcut::Apply(gesture) => {
+                            app.apply_layout_gesture(gesture);
+                            return FilterResult::Intercept(());
+                        }
+                        LayoutShortcut::Consumed => return FilterResult::Intercept(()),
+                        LayoutShortcut::Forward => {}
+                    }
                     if event.state() == smithay::backend::input::KeyState::Pressed && mods.logo {
                         if key.modified_sym() == keysyms::KEY_Escape.into() {
                             app.model.should_exit = true;

@@ -1,17 +1,32 @@
 //! Live session D-Bus services and compositor control transport.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader, Read, Write},
     os::unix::net::UnixStream,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use zbus::{interface, object_server::SignalEmitter, zvariant::OwnedValue};
+use zbus::{interface, message::Header, object_server::SignalEmitter, zvariant::OwnedValue};
+
+const NOTIFICATION_PATH: &str = "/org/freedesktop/Notifications";
+const MAX_ACTIONS: usize = 8;
+const MAX_PENDING_INTENTS: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotificationAction {
+    pub key: String,
+    pub label: String,
+}
 
 #[derive(Clone, Debug)]
 pub struct Notification {
     pub id: u32,
+    /// Changes on every replacement; UI input must target the rendered version.
+    pub generation: u64,
+    pub owner: String,
+    pub actions: Vec<NotificationAction>,
+    pub resident: bool,
     pub app: String,
     pub summary: String,
     pub body: String,
@@ -23,10 +38,51 @@ pub struct ShellState {
     pub reduced_transparency: bool,
     pub notifications: BTreeMap<u32, Notification>,
     next_id: u32,
+    next_generation: u64,
+    intents: VecDeque<NotificationIntent>,
+    // Serialize mutations with signal emission without holding the UI mutex across await.
+    notification_gate: Arc<tokio::sync::Mutex<()>>,
+}
+#[derive(Debug)]
+enum NotificationIntent {
+    Action {
+        id: u32,
+        generation: u64,
+        key: String,
+    },
+    Dismiss {
+        id: u32,
+        generation: u64,
+    },
+}
+#[derive(Debug, PartialEq, Eq)]
+enum NotificationEvent {
+    Action { id: u32, owner: String, key: String },
+    Closed { id: u32, owner: String, reason: u32 },
 }
 pub type SharedState = Arc<Mutex<ShellState>>;
 impl ShellState {
-    fn notify(&mut self, app: &str, replaces: u32, summary: &str, body: &str, timeout: i32) -> u32 {
+    #[allow(clippy::too_many_arguments)]
+    fn notify(
+        &mut self,
+        owner: &str,
+        app: &str,
+        replaces: u32,
+        summary: &str,
+        body: &str,
+        actions: Vec<NotificationAction>,
+        resident: bool,
+        timeout: i32,
+    ) -> zbus::fdo::Result<u32> {
+        if self
+            .notifications
+            .get(&replaces)
+            .is_some_and(|notification| notification.owner != owner)
+        {
+            return Err(zbus::fdo::Error::AccessDenied(
+                "Only the notifying sender can replace a notification".into(),
+            ));
+        }
         let id = if replaces != 0 && self.notifications.contains_key(&replaces) {
             replaces
         } else {
@@ -37,11 +93,16 @@ impl ShellState {
                 }
             }
         };
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
         let timeout = if timeout < 0 { 5000 } else { timeout };
         self.notifications.insert(
             id,
             Notification {
                 id,
+                generation: self.next_generation,
+                owner: owner.into(),
+                actions,
+                resident,
                 app: app.into(),
                 summary: summary.into(),
                 body: body.into(),
@@ -49,19 +110,159 @@ impl ShellState {
                     .then(|| Instant::now() + Duration::from_millis(timeout as u64)),
             },
         );
-        id
+        Ok(id)
     }
-    fn expired(&mut self, now: Instant) -> Vec<u32> {
+    fn expired(&mut self, now: Instant) -> Vec<NotificationEvent> {
         let ids: Vec<_> = self
             .notifications
             .values()
-            .filter(|n| n.expires.is_some_and(|e| e <= now))
-            .map(|n| n.id)
+            .filter(|notification| notification.expires.is_some_and(|expiry| expiry <= now))
+            .map(|notification| notification.id)
             .collect();
-        for id in &ids {
-            self.notifications.remove(id);
+        ids.into_iter()
+            .filter_map(|id| {
+                self.notifications
+                    .remove(&id)
+                    .map(|notification| NotificationEvent::Closed {
+                        id,
+                        owner: notification.owner,
+                        reason: 1,
+                    })
+            })
+            .collect()
+    }
+    fn pending_events(&mut self, now: Instant) -> Vec<NotificationEvent> {
+        // Enqueue already rejected expired cards. Honor accepted clicks before
+        // applying the next expiry tick, so polling latency cannot swallow a
+        // click made just before its deadline. Replacement generations still win.
+        let mut events = Vec::new();
+        while let Some(intent) = self.intents.pop_front() {
+            let (id, generation) = match &intent {
+                NotificationIntent::Action { id, generation, .. }
+                | NotificationIntent::Dismiss { id, generation } => (*id, *generation),
+            };
+            let Some(notification) = self
+                .notifications
+                .get(&id)
+                .filter(|notification| notification.generation == generation)
+            else {
+                continue;
+            };
+            let owner = notification.owner.clone();
+            match intent {
+                NotificationIntent::Action { key, .. } => {
+                    if !notification.actions.iter().any(|action| action.key == key) {
+                        continue;
+                    }
+                    let resident = notification.resident;
+                    events.push(NotificationEvent::Action {
+                        id,
+                        owner: owner.clone(),
+                        key,
+                    });
+                    if !resident {
+                        self.notifications.remove(&id);
+                        events.push(NotificationEvent::Closed {
+                            id,
+                            owner,
+                            reason: 2,
+                        });
+                    }
+                }
+                NotificationIntent::Dismiss { .. } => {
+                    self.notifications.remove(&id);
+                    events.push(NotificationEvent::Closed {
+                        id,
+                        owner,
+                        reason: 2,
+                    });
+                }
+            }
         }
-        ids
+        events.extend(self.expired(now));
+        events
+    }
+}
+
+fn parse_actions(actions: Vec<String>) -> zbus::fdo::Result<Vec<NotificationAction>> {
+    if !actions.len().is_multiple_of(2) || actions.len() > MAX_ACTIONS * 2 {
+        return Err(zbus::fdo::Error::InvalidArgs(
+            "Notification actions must contain at most eight key/label pairs".into(),
+        ));
+    }
+    let mut keys = HashSet::new();
+    let mut parsed = Vec::with_capacity(actions.len() / 2);
+    let mut parts = actions.into_iter();
+    while let Some(key) = parts.next() {
+        let label = parts.next().expect("validated paired actions");
+        if key.is_empty() || key.len() > 128 || label.len() > 512 || !keys.insert(key.clone()) {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "Notification action keys must be nonempty, unique and bounded".into(),
+            ));
+        }
+        parsed.push(NotificationAction { key, label });
+    }
+    Ok(parsed)
+}
+fn sender(header: &Header<'_>) -> zbus::fdo::Result<String> {
+    header
+        .sender()
+        .map(ToString::to_string)
+        .ok_or_else(|| zbus::fdo::Error::AccessDenied("A bus sender is required".into()))
+}
+
+/// Queue real UI input without D-Bus I/O. Stale and expired cards cannot invoke a replacement.
+pub fn enqueue_action(state: &SharedState, id: u32, generation: u64, key: &str) -> bool {
+    let mut state = state.lock().unwrap();
+    let now = Instant::now();
+    let valid = state.notifications.get(&id).is_some_and(|notification| {
+        notification.generation == generation
+            && notification.expires.is_none_or(|expiry| expiry > now)
+            && notification.actions.iter().any(|action| action.key == key)
+    });
+    if !valid || state.intents.len() >= MAX_PENDING_INTENTS {
+        return false;
+    }
+    state.intents.push_back(NotificationIntent::Action {
+        id,
+        generation,
+        key: key.into(),
+    });
+    true
+}
+/// Queue an explicit user dismissal; the service emits reason 2 on its runtime.
+pub fn enqueue_dismiss(state: &SharedState, id: u32, generation: u64) -> bool {
+    let mut state = state.lock().unwrap();
+    let now = Instant::now();
+    let valid = state.notifications.get(&id).is_some_and(|notification| {
+        notification.generation == generation
+            && notification.expires.is_none_or(|expiry| expiry > now)
+    });
+    if !valid || state.intents.len() >= MAX_PENDING_INTENTS {
+        return false;
+    }
+    state
+        .intents
+        .push_back(NotificationIntent::Dismiss { id, generation });
+    true
+}
+
+async fn emit_notification_event(
+    connection: &zbus::Connection,
+    event: NotificationEvent,
+) -> zbus::Result<()> {
+    let owner = match &event {
+        NotificationEvent::Action { owner, .. } | NotificationEvent::Closed { owner, .. } => owner,
+    };
+    let emitter = SignalEmitter::new(connection, NOTIFICATION_PATH)?
+        .set_destination(zbus::names::BusName::try_from(owner.as_str())?);
+    match &event {
+        NotificationEvent::Action { id, key, .. } => {
+            NotificationService::action_invoked(&emitter, *id, key).await
+        }
+        NotificationEvent::Closed { id, reason, .. } => {
+            NotificationService::notification_closed(&emitter, *id, *reason).await
+        }
     }
 }
 pub fn control_path() -> Result<PathBuf, String> {
@@ -142,47 +343,83 @@ pub struct NotificationService {
 #[interface(name = "org.freedesktop.Notifications")]
 impl NotificationService {
     fn get_capabilities(&self) -> Vec<&str> {
-        vec!["body"]
+        vec!["body", "actions", "persistence"]
     }
     fn get_server_information(&self) -> (&str, &str, &str, &str) {
         ("Aura Shell", "Aura DE", env!("CARGO_PKG_VERSION"), "1.2")
     }
     #[allow(clippy::too_many_arguments)]
-    fn notify(
+    async fn notify(
         &self,
         app_name: &str,
         replaces_id: u32,
         _app_icon: &str,
         summary: &str,
         body: &str,
-        _actions: Vec<String>,
-        _hints: std::collections::HashMap<String, OwnedValue>,
+        actions: Vec<String>,
+        hints: HashMap<String, OwnedValue>,
         expire_timeout: i32,
-    ) -> u32 {
-        self.state
-            .lock()
-            .unwrap()
-            .notify(app_name, replaces_id, summary, body, expire_timeout)
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<u32> {
+        let owner = sender(&header)?;
+        let actions = parse_actions(actions)?;
+        let resident = match hints.get("resident") {
+            Some(value) => bool::try_from(value)
+                .map_err(|_| zbus::fdo::Error::InvalidArgs("resident must be a boolean".into()))?,
+            None => false,
+        };
+        let gate = self.state.lock().unwrap().notification_gate.clone();
+        let _guard = gate.lock().await;
+        self.state.lock().unwrap().notify(
+            &owner,
+            app_name,
+            replaces_id,
+            summary,
+            body,
+            actions,
+            resident,
+            expire_timeout,
+        )
     }
     async fn close_notification(
         &self,
         id: u32,
+        #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        let removed = self
-            .state
-            .lock()
-            .unwrap()
-            .notifications
-            .remove(&id)
-            .is_some();
+        let owner = sender(&header)?;
+        let gate = self.state.lock().unwrap().notification_gate.clone();
+        let _guard = gate.lock().await;
+        let removed = {
+            let mut state = self.state.lock().unwrap();
+            if state
+                .notifications
+                .get(&id)
+                .is_some_and(|notification| notification.owner != owner)
+            {
+                return Err(zbus::fdo::Error::AccessDenied(
+                    "Only the notifying sender can close a notification".into(),
+                ));
+            }
+            state.notifications.remove(&id).is_some()
+        };
         if removed {
+            let emitter = emitter.set_destination(
+                zbus::names::BusName::try_from(owner.as_str())
+                    .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?,
+            );
             Self::notification_closed(&emitter, id, 3)
                 .await
-                .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
         }
         Ok(())
     }
+    #[zbus(signal)]
+    async fn action_invoked(
+        emitter: &SignalEmitter<'_>,
+        id: u32,
+        action_key: &str,
+    ) -> zbus::Result<()>;
     #[zbus(signal)]
     async fn notification_closed(
         emitter: &SignalEmitter<'_>,
@@ -232,19 +469,12 @@ pub fn start_services(state: SharedState) -> Result<(), String> {
             let _ = tx.send(Ok(()));
             loop {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                let expired = state.lock().unwrap().expired(Instant::now());
-                if let Ok(interface) = connection
-                    .object_server()
-                    .interface::<_, NotificationService>("/org/freedesktop/Notifications")
-                    .await
-                {
-                    for id in expired {
-                        let _ = NotificationService::notification_closed(
-                            interface.signal_emitter(),
-                            id,
-                            1,
-                        )
-                        .await;
+                let gate = state.lock().unwrap().notification_gate.clone();
+                let _guard = gate.lock().await;
+                let events = state.lock().unwrap().pending_events(Instant::now());
+                for event in events {
+                    if let Err(error) = emit_notification_event(&connection, event).await {
+                        tracing::warn!(%error, "Notification signal delivery failed");
                     }
                 }
             }
@@ -256,21 +486,225 @@ pub fn start_services(state: SharedState) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn notify(
+        state: &mut ShellState,
+        owner: &str,
+        replaces: u32,
+        actions: &[&str],
+        resident: bool,
+        timeout: i32,
+    ) -> u32 {
+        state
+            .notify(
+                owner,
+                "app",
+                replaces,
+                "summary",
+                "body",
+                parse_actions(actions.iter().map(|value| (*value).into()).collect()).unwrap(),
+                resident,
+                timeout,
+            )
+            .unwrap()
+    }
     #[test]
-    fn replacement_ids_and_expiration() {
-        let mut s = ShellState::default();
-        let a = s.notify("app", 0, "first", "body", 100);
-        let b = s.notify("app", a, "replacement", "", 0);
-        assert_eq!(a, b);
-        assert_eq!(s.notifications.len(), 1);
-        assert_eq!(s.notifications[&a].summary, "replacement");
+    fn replacement_ids_ownership_and_expiration() {
+        let mut state = ShellState::default();
+        let first = notify(&mut state, ":1.1", 0, &[], false, 100);
+        let generation = state.notifications[&first].generation;
         assert!(
-            s.expired(Instant::now() + Duration::from_secs(1))
+            state
+                .notify(":1.2", "other", first, "foreign", "", vec![], false, 0)
+                .is_err()
+        );
+        assert_eq!(first, notify(&mut state, ":1.1", first, &[], false, 0));
+        assert_ne!(generation, state.notifications[&first].generation);
+        assert!(
+            state
+                .expired(Instant::now() + Duration::from_secs(1))
                 .is_empty()
         );
-        let c = s.notify("app", 0, "expires", "", 1);
-        assert_ne!(c, a);
-        assert_eq!(s.expired(Instant::now() + Duration::from_secs(1)), vec![c]);
-        assert!(s.notifications.contains_key(&a));
+        let expiring = notify(&mut state, ":1.1", 0, &[], false, 1);
+        assert_eq!(
+            state.expired(Instant::now() + Duration::from_secs(1)),
+            vec![NotificationEvent::Closed {
+                id: expiring,
+                owner: ":1.1".into(),
+                reason: 1
+            }]
+        );
+        assert!(state.notifications.contains_key(&first));
+    }
+    #[test]
+    fn malformed_actions_are_rejected_without_silent_truncation() {
+        for values in [
+            vec!["open"],
+            vec!["", "label"],
+            vec!["open", "one", "open", "two"],
+        ] {
+            assert!(parse_actions(values.into_iter().map(String::from).collect()).is_err());
+        }
+        let many = (0..9)
+            .flat_map(|index| [format!("key-{index}"), "label".into()])
+            .collect();
+        assert!(parse_actions(many).is_err());
+        assert_eq!(
+            parse_actions(vec!["default".into(), "".into()]).unwrap()[0].label,
+            ""
+        );
+    }
+    #[test]
+    fn action_closes_nonresident_once_and_keeps_resident_until_dismissed() {
+        let state = SharedState::default();
+        let first = notify(
+            &mut state.lock().unwrap(),
+            ":1.1",
+            0,
+            &["open", "Open"],
+            false,
+            0,
+        );
+        let generation = state.lock().unwrap().notifications[&first].generation;
+        assert!(!enqueue_action(&state, first, generation, "unknown"));
+        assert!(enqueue_action(&state, first, generation, "open"));
+        assert!(enqueue_action(&state, first, generation, "open"));
+        assert_eq!(
+            state.lock().unwrap().pending_events(Instant::now()),
+            vec![
+                NotificationEvent::Action {
+                    id: first,
+                    owner: ":1.1".into(),
+                    key: "open".into()
+                },
+                NotificationEvent::Closed {
+                    id: first,
+                    owner: ":1.1".into(),
+                    reason: 2
+                },
+            ]
+        );
+        let resident = notify(
+            &mut state.lock().unwrap(),
+            ":1.2",
+            0,
+            &["default", "Open"],
+            true,
+            0,
+        );
+        let generation = state.lock().unwrap().notifications[&resident].generation;
+        assert!(enqueue_action(&state, resident, generation, "default"));
+        assert_eq!(
+            state.lock().unwrap().pending_events(Instant::now()),
+            vec![NotificationEvent::Action {
+                id: resident,
+                owner: ":1.2".into(),
+                key: "default".into()
+            },]
+        );
+        assert!(state.lock().unwrap().notifications.contains_key(&resident));
+        assert!(enqueue_dismiss(&state, resident, generation));
+        assert_eq!(
+            state.lock().unwrap().pending_events(Instant::now()),
+            vec![NotificationEvent::Closed {
+                id: resident,
+                owner: ":1.2".into(),
+                reason: 2
+            },]
+        );
+    }
+    #[test]
+    fn rendered_generation_cannot_activate_or_dismiss_a_replacement() {
+        let state = SharedState::default();
+        let id = notify(
+            &mut state.lock().unwrap(),
+            ":1.1",
+            0,
+            &["open", "Open"],
+            true,
+            0,
+        );
+        let generation = state.lock().unwrap().notifications[&id].generation;
+        assert!(enqueue_action(&state, id, generation, "open"));
+        assert!(enqueue_dismiss(&state, id, generation));
+        notify(
+            &mut state.lock().unwrap(),
+            ":1.1",
+            id,
+            &["open", "New open"],
+            true,
+            0,
+        );
+        assert!(!enqueue_action(&state, id, generation, "open"));
+        assert!(!enqueue_dismiss(&state, id, generation));
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .pending_events(Instant::now())
+                .is_empty()
+        );
+        assert!(state.lock().unwrap().notifications.contains_key(&id));
+    }
+    #[test]
+    fn accepted_click_is_not_lost_to_the_next_expiry_poll() {
+        let state = SharedState::default();
+        let id = notify(
+            &mut state.lock().unwrap(),
+            ":1.1",
+            0,
+            &["open", "Open"],
+            false,
+            1000,
+        );
+        let generation = state.lock().unwrap().notifications[&id].generation;
+        assert!(enqueue_action(&state, id, generation, "open"));
+        assert_eq!(
+            state
+                .lock()
+                .unwrap()
+                .pending_events(Instant::now() + Duration::from_secs(2)),
+            vec![
+                NotificationEvent::Action {
+                    id,
+                    owner: ":1.1".into(),
+                    key: "open".into()
+                },
+                NotificationEvent::Closed {
+                    id,
+                    owner: ":1.1".into(),
+                    reason: 2
+                },
+            ]
+        );
+    }
+    #[test]
+    fn expired_cards_reject_input_and_emit_only_expiry() {
+        let state = SharedState::default();
+        let id = notify(
+            &mut state.lock().unwrap(),
+            ":1.1",
+            0,
+            &["open", "Open"],
+            false,
+            1,
+        );
+        let generation = state.lock().unwrap().notifications[&id].generation;
+        state
+            .lock()
+            .unwrap()
+            .notifications
+            .get_mut(&id)
+            .unwrap()
+            .expires = Some(Instant::now());
+        assert!(!enqueue_action(&state, id, generation, "open"));
+        assert!(!enqueue_dismiss(&state, id, generation));
+        assert_eq!(
+            state.lock().unwrap().pending_events(Instant::now()),
+            vec![NotificationEvent::Closed {
+                id,
+                owner: ":1.1".into(),
+                reason: 1
+            },]
+        );
     }
 }

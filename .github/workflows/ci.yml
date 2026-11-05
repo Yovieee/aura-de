@@ -21,6 +21,8 @@ jobs:
         run: sudo bash scripts/install-deps.sh --native --testing
       - name: Verify X11 keyboard runtime
         run: python3 -c 'import ctypes; ctypes.CDLL("libxkbcommon-x11.so.0")'
+      - name: Verify virtual X11 startup and failure cleanup
+        run: python3 -m unittest discover -s scripts/tests -p test_xvfb.py -v
       - name: Install pinned Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -38,13 +40,15 @@ jobs:
         run: |
           cargo build --workspace --bins --examples --locked
       - name: Nested Wayland integration smoke
-        run: python3 scripts/smoke_nested.py --software
+        run: python3 scripts/smoke_nested.py --software --no-build
       - name: Desktop lifecycle integration
-        run: python3 scripts/integration_desktop.py --software
+        run: python3 scripts/integration_desktop.py --software --no-build
       - name: Session and real input integration
         run: python3 scripts/session_smoke.py --no-build
       - name: Live application catalog, activation and magnified Dock input
         run: python3 scripts/launcher_dock_smoke.py --no-build
+      - name: Notification actions, desktop settings and layout shortcuts
+        run: python3 scripts/desktop_controls_smoke.py --no-build
       - name: Idle rendering, retained glass cache and window chrome
         run: python3 scripts/window_render_smoke.py --no-build
       - name: GPU pixel readback and GLES driver compilation
@@ -79,9 +83,11 @@ jobs:
           name: nested-smoke-logs
           path: |
             target/smoke-logs/
+            target/xvfb-logs/
             target/desktop-smoke-logs/
             target/session-smoke-logs/
             target/launcher-dock-smoke-logs/
+            target/desktop-controls-smoke-logs/
             target/window-render-smoke-logs/
             target/screencast-smoke-logs/
             target/driver-logs/

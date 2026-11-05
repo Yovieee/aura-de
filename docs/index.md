@@ -8,3 +8,5 @@
 * [Wayland Protocols & Session Lifecycle](wayland-protocols.md)
 
 * [Application discovery, launching and Dock input](application-launching.md)
+
+* [Notifications, settings and layout shortcuts](desktop-controls.md)

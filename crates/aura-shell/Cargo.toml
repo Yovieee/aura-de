@@ -1,5 +1,6 @@
 [package]
 name = "aura-shell"
+default-run = "aura-shell"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,12 +11,16 @@ description = "Liquid Glass Top Menu Bar, Parabolic Dock, and zbus D-Bus session
 name = "aura-shell"
 path = "src/main.rs"
 
+[[bin]]
+name = "aura-settings"
+path = "src/bin/settings.rs"
+
 [dependencies]
 aura-core = { path = "../aura-core" }
 smithay-client-toolkit = { workspace = true, features = ["xkbcommon"] }
 wayland-client = { workspace = true }
 zbus = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util"] }
 serde = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
