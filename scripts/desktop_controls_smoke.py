@@ -35,7 +35,8 @@ def main():
         subprocess.run(['cargo', 'build', '--workspace', '--bins', '--examples', '--locked'], cwd=ROOT, check=True)
     target = Path(json.loads(subprocess.check_output(
         ['cargo', 'metadata', '--locked', '--no-deps', '--format-version', '1'], cwd=ROOT))['target_directory']) / 'debug'
-    for path in [target / 'aura-session', target / 'aura-settings', target / 'examples/notification_probe']:
+    for path in [target / 'aura-session', target / 'aura-settings', target / 'examples/notification_probe',
+                 target / 'examples/smoke_client']:
         require(path.is_file(), f'Missing {path}; rerun without --no-build')
     args.log_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -226,6 +227,55 @@ def main():
             until(lambda: status()['layout'] == 'floating', 'shortcut after host focus return')
             evidence['focus_loss'] = 'release outside the host window clears Super; plain arrow remains plain'
 
+            # Observe actual wl_pointer events while the physical button remains held.
+            # A later X11 release alone would not prove compositor-side grab cleanup.
+            pointer_probe = launch('pointer-focus', [str(target / 'examples/smoke_client'),
+                '--idle-on-ready', '--observe-pointer', '--title', 'PointerFocusProbe'])
+            until(lambda: 'SMOKE_CLIENT_OK' in logs['pointer-focus'].read_text() and
+                  status()['mapped_windows'] == 1, 'real pointer observer presentation')
+            time.sleep(0.6)
+            rect = json.loads(command(control, 'windows'))[0]['rect']
+            center = int(rect['x'] + rect['width'] / 2), int(rect['y'] + rect['height'] / 2)
+
+            def pointer_events():
+                return [line for line in logs['pointer-focus'].read_text().splitlines()
+                        if line.startswith('POINTER_')]
+
+            def pointer_buttons():
+                return [line.rsplit('=', 1)[1] for line in pointer_events()
+                        if line.startswith('POINTER_BUTTON button=272 ')]
+
+            input_.t.XTestFakeMotionEvent(input_.d, 0, *center, 0)
+            x.XFlush(input_.d)
+            until(lambda: 'POINTER_ENTER' in pointer_events(), 'actual client pointer enter')
+            input_.t.XTestFakeButtonEvent(input_.d, 1, 1, 0)
+            x.XFlush(input_.d)
+            until(lambda: pointer_buttons() == ['Pressed'], 'actual held client pointer press')
+            x.XSetInputFocus(input_.d, x.XDefaultRootWindow(input_.d), 2, 0)
+            x.XFlush(input_.d)
+            until(lambda: pointer_buttons() == ['Pressed', 'Released'] and
+                  pointer_events()[-1] == 'POINTER_LEAVE',
+                  'synthetic button release and pointer leave before physical release')
+            input_.t.XTestFakeMotionEvent(input_.d, 0, 1200, 800, 0)
+            input_.t.XTestFakeButtonEvent(input_.d, 1, 0, 0)
+            x.XFlush(input_.d)
+            time.sleep(0.15)
+            require(pointer_buttons() == ['Pressed', 'Released'],
+                    'Late physical release duplicated the compositor release')
+            focus = Input(env['DISPLAY']); focus.close()
+            time.sleep(0.15)
+            input_.click(*center)
+            until(lambda: pointer_buttons() == ['Pressed', 'Released', 'Pressed', 'Released'],
+                  'balanced client pointer click after focus returns')
+            pointer_probe.terminate()
+            pointer_probe.wait(timeout=3)
+            until(lambda: status()['mapped_windows'] == 0, 'pointer observer cleanup')
+            evidence['pointer_focus_loss'] = {
+                'released_and_left_before_physical_release': True,
+                'late_release_does_not_duplicate': True,
+                'balanced_click_after_focus_returns': True,
+            }
+
             # An unreachable readback must show an error rather than a committed state.
             missing = launch('settings-unavailable', [str(target / 'aura-settings')],
                              {'AURA_CONTROL_SOCKET': str(runtime / 'missing-control.sock')})
@@ -272,7 +322,7 @@ def main():
             require(session.wait(timeout=10) == 0, 'Supervisor shutdown failed')
             require(not control.exists() and not (runtime / 'wayland-desktop-controls').exists(), 'Session socket leaked')
         (args.log_dir / 'results.json').write_text(json.dumps(evidence, indent=2) + '\n')
-        print('PASS: actual notification action/dismiss/resident/pagination signals, desktop settings, DND, keyboard shortcuts and cleanup.')
+        print('PASS: actual notification signals, desktop settings, DND, shortcuts, held-pointer focus cleanup and session cleanup.')
         print('Physical touchpad gesture input is not exercised by the nested Xvfb backend.')
         print(f'Logs and evidence: {args.log_dir}')
         return 0

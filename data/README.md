@@ -1,17 +1,19 @@
 # Session and portal data
 
-These files are templates for development packaging. Aura currently implements a
-nested winit session, so the session entry explicitly requires an existing
-Wayland/X11 graphical host. It is **not** a working bare-metal display-manager
-session. Do not install it as the default login session until a DRM backend is
-implemented and tested.
+These files are templates for development packaging. The default session entry
+launches the nested winit backend and requires an existing Wayland/X11 graphical
+host. The optional experimental DRM/KMS backend is described in
+`docs/native-backend.md`; it has not been validated on target hardware. The
+installed entry is **not** a working bare-metal display-manager session. Do not
+install it as the default login session before native hardware validation.
 
 `aura-session` starts the compositor, waits until its Wayland socket accepts a
 connection, starts the shell, and terminates/reaps its child process groups when
 SIGINT/SIGTERM arrives or a child exits. With no existing session bus, it replaces
 itself with `dbus-run-session -- aura-session ...`. Run `aura-session --help` for
 binary path overrides and startup timeout. It preserves the host display for
-winit and sets the nested display only on client processes.
+winit and removes host display variables for the DRM child. Shell/application
+processes use Aura's Wayland socket after the compositor is ready.
 
 Portal activation data belongs under `$prefix/share/dbus-1/services/` and
 `$prefix/share/xdg-desktop-portal/portals/`. Ensure the built `aura-session` binary
@@ -28,8 +30,8 @@ does not grant capture access. No simulated node IDs are returned.
 Capture supports one monitor with hidden cursor, fixed-size SDR RGBA pixels and
 at most 4096 pixels per axis. Output resize ends a stream and requires fresh
 selection/consent. This is a CPU-copy path, not zero-copy DMA-BUF capture. Native
-hardware sessions, HDR and multioutput remain unsupported. Installing descriptors
-alone does not create a supervised source, daemon or user consent. See
+backend capture is disabled pending validation; HDR and multioutput are unsupported.
+Installing descriptors alone does not create a supervised source, daemon or user consent. See
 `docs/screencast.md` and the observed evidence in `docs/implementation-status.md`.
 
 To test activation on a desktop host, install descriptors to a user or system
@@ -42,5 +44,7 @@ The standard development install includes `aura-settings` and
 `share/applications/org.aura.Settings.desktop`. The entry is shown in an Aura
 session and launches controls for the current session's layout, glass quality
 and Do Not Disturb state. It needs the running compositor and `org.aura.Shell1`
-on the same session bus. It does not configure system hardware or persist
-preferences across session restarts. See `docs/desktop-controls.md`.
+on the same session bus. Settings changes persist layout, glass quality and Do
+Not Disturb in the user's versioned preferences file; load/save failures appear
+in the panel. It does not configure system hardware. See
+`docs/desktop-controls.md`.

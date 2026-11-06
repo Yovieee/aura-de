@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- An optional experimental single-connector DRM/KMS backend using libseat, GBM/EGL and libinput, sharing window management and rendering with the nested backend. Feature selection and invalid-device startup are tested; native hardware presentation remains unverified.
+- Native/nested framebuffer orientation checks on a real software GLES driver, and pointer-focus recovery coverage that verifies held-button release before the physical release arrives.
 - Notification action cards with paged buttons, resident behavior, generation checks and action/close signals directed to the originating application.
 - `aura-settings` controls for layout, glass quality and Do Not Disturb, packaged with an Aura application entry.
 - Versioned user preferences restored at shell startup and saved through Settings or acknowledged Shell1 setters with atomic, private file replacement and visible errors. Invalid or unsupported existing files are preserved; quick layout controls remain session-only until a later settings save.

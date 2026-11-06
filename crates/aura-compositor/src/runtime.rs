@@ -1,6 +1,7 @@
 //! Real Wayland protocols, input routing and nested EGL presentation.
 use crate::{
-    Config,
+    Backend, Config,
+    backend::{BackendEvent, Presenter},
     capture::{CaptureConfig, CaptureProducer},
     decorations::{self, DecorationHit},
     glass::{GlassPanel, GlassRenderer},
@@ -20,7 +21,7 @@ use smithay::{
     backend::{
         input::{
             AbsolutePositionEvent, Axis, ButtonState, Event, InputBackend, InputEvent,
-            KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+            KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
         },
         renderer::{
             Color32F, Frame, Renderer,
@@ -35,7 +36,7 @@ use smithay::{
                 with_renderer_surface_state,
             },
         },
-        winit::{self, WinitEvent},
+        winit::WinitEvent,
     },
     delegate_compositor, delegate_data_device, delegate_layer_shell, delegate_output,
     delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
@@ -47,7 +48,9 @@ use smithay::{
     input::{
         Seat, SeatHandler, SeatState,
         keyboard::{FilterResult, keysyms},
-        pointer::{AxisFrame, ButtonEvent, CursorImageStatus, Focus, MotionEvent},
+        pointer::{
+            AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, Focus, MotionEvent,
+        },
     },
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     utils::{Logical, Point, SERIAL_COUNTER, Serial, Transform},
@@ -139,6 +142,10 @@ struct App {
     swipe: SwipeGestureState,
     layout_shortcut_keys: LayoutShortcutState,
     host_focused: bool,
+    backend: Backend,
+    requested_vt: Option<i32>,
+    cursor_status: CursorImageStatus,
+    pressed_pointer_buttons: HashSet<u32>,
     scale: i32,
     glass_ready: bool,
     frame_dirty: bool,
@@ -177,6 +184,29 @@ impl App {
                 |_, _, _| FilterResult::Forward,
             );
         }
+        let pointer = self.seat.get_pointer().unwrap();
+        for button in std::mem::take(&mut self.pressed_pointer_buttons) {
+            pointer.button(
+                self,
+                &ButtonEvent {
+                    button,
+                    state: ButtonState::Released,
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time,
+                },
+            );
+        }
+        pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), time);
+        pointer.motion(
+            self,
+            None,
+            &MotionEvent {
+                location: self.pointer,
+                serial: SERIAL_COUNTER.next_serial(),
+                time,
+            },
+        );
+        pointer.frame(self);
         self.layout_shortcut_keys = LayoutShortcutState::default();
         self.swipe = SwipeGestureState::default();
         self.drag = None;
@@ -595,6 +625,7 @@ impl App {
         let parts: Vec<_> = text.split_whitespace().collect();
         match parts.as_slice() {
             ["status"] => Ok(serde_json::json!({
+                "backend": match self.backend { Backend::Winit=>"winit", Backend::Drm=>"drm" },
                 "layout": match self.model.workspace.mode { LayoutMode::Floating=>"floating",LayoutMode::StageManager=>"stage-manager",LayoutMode::DynamicTiling=>"tiling" },
                 "quality": if self.model.glass_material.kawase_blur_passes==0 {"reduced-transparency"} else if self.model.glass_material.chromatic_dispersion==0.0 {"balanced"} else {"ultra"},
                 "mapped_windows": self.toplevels.iter().filter(|t|t.mapped).count(),
@@ -621,7 +652,10 @@ impl App {
         self.scene_generation = self.scene_generation.wrapping_add(1);
         let mode = Mode {
             size,
-            refresh: 60_000,
+            refresh: self
+                .output
+                .current_mode()
+                .map_or(60_000, |mode| mode.refresh),
         };
         self.output
             .change_current_state(Some(mode), None, None, None);
@@ -667,7 +701,12 @@ impl SeatHandler for App {
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         set_data_device_focus(&self.dh, seat, focused.and_then(|s| s.client()));
     }
-    fn cursor_image(&mut self, _: &Seat<Self>, _: CursorImageStatus) {}
+    fn cursor_image(&mut self, _: &Seat<Self>, status: CursorImageStatus) {
+        self.cursor_status = status;
+        if self.backend == Backend::Drm {
+            self.frame_dirty = true;
+        }
+    }
 }
 impl CompositorHandler for App {
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -1082,7 +1121,15 @@ fn control_server(
     })
 }
 
-pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
+pub(crate) fn run(mut config: Config) -> Result<(), Box<dyn Error>> {
+    let mut backend = Presenter::new(&config)?;
+    let initial_size = backend.size();
+    if initial_size.w < 64 || initial_size.h < 64 || initial_size.w > 8192 || initial_size.h > 8192
+    {
+        return Err("output resolution must be between 64 and 8192 pixels per axis".into());
+    }
+    config.size = (initial_size.w, initial_size.h);
+    let output_info = backend.output_info();
     let mut display = Display::<App>::new()?;
     let mut dh = display.handle();
     let mut seats = SeatState::new();
@@ -1090,18 +1137,18 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
     seat.add_keyboard(Default::default(), 200, 25)?;
     seat.add_pointer();
     let output = Output::new(
-        "AURA-1".into(),
+        output_info.name,
         PhysicalProperties {
-            size: (300, 200).into(),
+            size: output_info.physical_size.into(),
             subpixel: Subpixel::Unknown,
-            make: "Aura".into(),
-            model: "Nested".into(),
+            make: output_info.make,
+            model: output_info.model,
         },
     );
     output.create_global::<App>(&dh);
     let mode = Mode {
         size: config.size.into(),
-        refresh: 60_000,
+        refresh: output_info.refresh,
     };
     output.change_current_state(
         Some(mode),
@@ -1137,6 +1184,10 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
         swipe: SwipeGestureState::default(),
         layout_shortcut_keys: LayoutShortcutState::default(),
         host_focused: true,
+        backend: config.backend,
+        requested_vt: None,
+        cursor_status: CursorImageStatus::default_named(),
+        pressed_pointer_buttons: HashSet::new(),
         scale: config.scale,
         glass_ready: false,
         frame_dirty: true,
@@ -1168,14 +1219,7 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
         }
     })?;
     let _control = control_server(tx)?;
-    let attributes = ::winit::window::Window::default_attributes()
-        .with_title("Aura DE — Nested")
-        .with_inner_size(::winit::dpi::PhysicalSize::new(
-            config.size.0 as u32,
-            config.size.1 as u32,
-        ));
-    let (mut backend, mut input) = winit::init_from_attributes::<GlesRenderer>(attributes)?;
-    tracing::info!(socket=%config.socket,"Wayland server listening; basic GLES renderer active");
+    tracing::info!(socket=%config.socket,backend=?config.backend,"Wayland server listening; GLES renderer active");
     let stop = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone())?;
     signal_hook::flag::register(signal_hook::consts::SIGTERM, stop.clone())?;
@@ -1186,7 +1230,7 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let mut glass_initialization_attempted = false;
     let mut previous_scene_key = app.scene_key();
     let mut capture_producer = None;
-    {
+    if backend.supports_capture() {
         let (renderer, _) = backend.bind()?;
         match CaptureConfig::from_env(backend_size(config.size)) {
             Ok(Some(config)) => match CaptureProducer::new(renderer, config) {
@@ -1201,17 +1245,35 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
         }
     }
     while !app.model.should_exit && !stop.load(Ordering::Relaxed) {
-        let status = input.dispatch_new_events(|event| match event {
-            WinitEvent::Resized { .. } | WinitEvent::Redraw => {
-                app.frame_dirty = true;
+        for event in backend.poll_events()? {
+            match event {
+                BackendEvent::Winit(event) => match event {
+                    WinitEvent::Resized { .. } | WinitEvent::Redraw => app.frame_dirty = true,
+                    WinitEvent::Input(event) => handle_input(&mut app, event),
+                    WinitEvent::Focus(focused) => {
+                        app.host_focus_changed(focused, start.elapsed().as_millis() as u32)
+                    }
+                    WinitEvent::CloseRequested => app.model.should_exit = true,
+                },
+                #[cfg(feature = "native")]
+                BackendEvent::Native(event) => match event {
+                    crate::native::NativeEvent::Input(event) => handle_input(&mut app, event),
+                    crate::native::NativeEvent::Activated(active) => {
+                        app.host_focus_changed(active, start.elapsed().as_millis() as u32);
+                        app.frame_dirty = true;
+                        if let Some(glass) = &mut glass_renderer {
+                            glass.invalidate();
+                        }
+                    }
+                },
             }
-            WinitEvent::Input(event) => handle_input(&mut app, event),
-            WinitEvent::Focus(focused) => {
-                app.host_focus_changed(focused, start.elapsed().as_millis() as u32)
-            }
-            WinitEvent::CloseRequested => app.model.should_exit = true,
-        });
-        if matches!(status, ::winit::platform::pump_events::PumpStatus::Exit(_)) {
+        }
+        if let Some(vt) = app.requested_vt.take()
+            && let Err(error) = backend.change_vt(vt)
+        {
+            tracing::warn!(%error,vt,"VT switch failed");
+        }
+        if app.model.should_exit {
             break;
         }
         while let Some(stream) = listener.accept()? {
@@ -1220,7 +1282,7 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
         display.dispatch_clients(&mut app)?;
         app.popups.cleanup();
         events.dispatch(Duration::from_millis(8), &mut app)?;
-        let size = backend.window_size();
+        let size = backend.size();
         if app.output.current_mode().is_none_or(|m| m.size != size) {
             app.resize(size);
         }
@@ -1262,10 +1324,11 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
                 tracing::warn!(%error,"capture completion failed");
             }
         }
-        if !app.frame_dirty && !capture_due {
+        if !backend.can_render() || (!app.frame_dirty && !capture_due) {
             display.flush_clients()?;
             continue;
         }
+        let output_transform = backend.output_transform();
         let damage = smithay::utils::Rectangle::from_size(size);
         let mut rendered = Vec::new();
         {
@@ -1447,6 +1510,7 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
                     renderer,
                     &mut framebuffer,
                     size,
+                    output_transform,
                     config.scale as f64,
                     app.scene_generation,
                     &scene,
@@ -1461,7 +1525,7 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
                 if let Some(Err(error)) = result {
                     tracing::warn!(%error,"glass render failed; using opaque panel fallback");
                 }
-                let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
+                let mut frame = renderer.render(&mut framebuffer, size, output_transform)?;
                 frame.clear(Color32F::new(0.065, 0.085, 0.14, 1.), &[damage])?;
                 draw_render_elements(&mut frame, config.scale as f64, &scene, &[damage])?;
                 for panel in &panels {
@@ -1494,12 +1558,22 @@ pub(crate) fn run(config: Config) -> Result<(), Box<dyn Error>> {
                     tracing::warn!(%error,"capture resize failed");
                 }
                 if capture_due {
-                    let mut frame =
-                        renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
+                    let mut frame = renderer.render(&mut framebuffer, size, output_transform)?;
                     if let Err(error) = capture.enqueue(&mut frame, size) {
                         tracing::warn!(%error,"capture enqueue failed");
                     }
                     let _sync = frame.finish()?;
+                }
+            }
+            if app.backend == Backend::Drm {
+                let cursor = cursor_elements(&app, renderer);
+                if !cursor.is_empty() {
+                    let mut frame = renderer.render(&mut framebuffer, size, output_transform)?;
+                    draw_render_elements(&mut frame, config.scale as f64, &cursor, &[damage])?;
+                    let _sync = frame.finish()?;
+                    if let CursorImageStatus::Surface(surface) = &app.cursor_status {
+                        rendered.push(surface.clone());
+                    }
                 }
             }
             if has_client {
@@ -1555,6 +1629,16 @@ fn handle_input<B: InputBackend>(app: &mut App, event: InputEvent<B>) {
                 SERIAL_COUNTER.next_serial(),
                 event.time_msec(),
                 |app, mods, key| {
+                    if app.backend == Backend::Drm
+                        && mods.ctrl
+                        && mods.alt
+                        && let Some(vt) = vt_for_keysym(key.modified_sym().raw())
+                    {
+                        if event.state() == smithay::backend::input::KeyState::Pressed {
+                            app.requested_vt = Some(vt);
+                        }
+                        return FilterResult::Intercept(());
+                    }
                     // Nested winit does not expose raw touchpad gestures. These
                     // keyboard alternatives use the same committed layout action.
                     match app.layout_shortcut_keys.process(
@@ -1600,51 +1684,21 @@ fn handle_input<B: InputBackend>(app: &mut App, event: InputEvent<B>) {
                 .unwrap()
                 .size
                 .to_logical(app.scale);
-            app.pointer = event.position_transformed(size);
-            if let Some(drag) = &app.drag {
-                let dx = (app.pointer.x - drag.origin.x) as f32;
-                let dy = (app.pointer.y - drag.origin.y) as f32;
-                let mut r = drag.rect;
-                if let Some(edges) = drag.edges {
-                    let e = edges as u32;
-                    if e & 4 != 0 {
-                        r.x += dx;
-                        r.width -= dx;
-                    }
-                    if e & 8 != 0 {
-                        r.width += dx;
-                    }
-                    if e & 1 != 0 {
-                        r.y += dy;
-                        r.height -= dy;
-                    }
-                    if e & 2 != 0 {
-                        r.height += dy;
-                    }
-                } else {
-                    r.x += dx;
-                    r.y += dy;
-                }
-                let id = drag.id;
-                app.model.workspace.mode = LayoutMode::Floating;
-                app.model.workspace.set_floating_rect(id, r);
-                app.configure_windows();
-            }
-            let focus = app.surface_under();
-            let pointer = app.seat.get_pointer().unwrap();
-            pointer.motion(
-                app,
-                focus,
-                &MotionEvent {
-                    location: app.pointer,
-                    serial: SERIAL_COUNTER.next_serial(),
-                    time: event.time_msec(),
-                },
-            );
-            pointer.frame(app);
+            move_pointer(app, event.position_transformed(size), event.time_msec());
+        }
+        InputEvent::PointerMotion { event } => {
+            move_pointer(app, app.pointer + event.delta(), event.time_msec());
         }
         InputEvent::PointerButton { event } => {
             let pointer = app.seat.get_pointer().unwrap();
+            if event.state() == ButtonState::Released {
+                app.drag = None;
+                // A physical release may arrive after focus/seat loss already
+                // synthesized it, or after a compositor-owned chrome press.
+                if !app.pressed_pointer_buttons.contains(&event.button_code()) {
+                    return;
+                }
+            }
             if event.state() == ButtonState::Pressed
                 && let Some((id, rect, hit)) = app.chrome_under()
             {
@@ -1695,6 +1749,11 @@ fn handle_input<B: InputBackend>(app: &mut App, event: InputEvent<B>) {
             } else {
                 app.drag = None;
             }
+            if event.state() == ButtonState::Pressed {
+                app.pressed_pointer_buttons.insert(event.button_code());
+            } else {
+                app.pressed_pointer_buttons.remove(&event.button_code());
+            }
             pointer.button(
                 app,
                 &ButtonEvent {
@@ -1724,6 +1783,153 @@ fn handle_input<B: InputBackend>(app: &mut App, event: InputEvent<B>) {
     }
 }
 
+fn bounded_pointer(
+    location: Point<f64, Logical>,
+    size: smithay::utils::Size<i32, Logical>,
+) -> Option<Point<f64, Logical>> {
+    (location.x.is_finite() && location.y.is_finite()).then(|| {
+        (
+            location.x.clamp(0., f64::from((size.w - 1).max(0))),
+            location.y.clamp(0., f64::from((size.h - 1).max(0))),
+        )
+            .into()
+    })
+}
+fn move_pointer(app: &mut App, location: Point<f64, Logical>, time: u32) {
+    let size = app
+        .output
+        .current_mode()
+        .unwrap()
+        .size
+        .to_logical(app.scale);
+    let Some(location) = bounded_pointer(location, size) else {
+        return;
+    };
+    app.pointer = location;
+    if app.backend == Backend::Drm {
+        app.frame_dirty = true;
+    }
+    if let Some(drag) = &app.drag {
+        let dx = (app.pointer.x - drag.origin.x) as f32;
+        let dy = (app.pointer.y - drag.origin.y) as f32;
+        let mut r = drag.rect;
+        if let Some(edges) = drag.edges {
+            let e = edges as u32;
+            if e & 4 != 0 {
+                r.x += dx;
+                r.width -= dx;
+            }
+            if e & 8 != 0 {
+                r.width += dx;
+            }
+            if e & 1 != 0 {
+                r.y += dy;
+                r.height -= dy;
+            }
+            if e & 2 != 0 {
+                r.height += dy;
+            }
+        } else {
+            r.x += dx;
+            r.y += dy;
+        }
+        let id = drag.id;
+        app.model.workspace.mode = LayoutMode::Floating;
+        app.model.workspace.set_floating_rect(id, r);
+        app.configure_windows();
+    }
+    let focus = app.surface_under();
+    let pointer = app.seat.get_pointer().unwrap();
+    pointer.motion(
+        app,
+        focus,
+        &MotionEvent {
+            location: app.pointer,
+            serial: SERIAL_COUNTER.next_serial(),
+            time,
+        },
+    );
+    pointer.frame(app);
+}
+
+fn vt_for_keysym(key: u32) -> Option<i32> {
+    // The default XKB map translates Ctrl+Alt+Fn to XF86Switch_VT_n.
+    if (keysyms::KEY_XF86Switch_VT_1..=keysyms::KEY_XF86Switch_VT_12).contains(&key) {
+        Some((key - keysyms::KEY_XF86Switch_VT_1 + 1) as i32)
+    } else if (keysyms::KEY_F1..=keysyms::KEY_F12).contains(&key) {
+        Some((key - keysyms::KEY_F1 + 1) as i32)
+    } else {
+        None
+    }
+}
+
+fn cursor_elements(app: &App, renderer: &mut GlesRenderer) -> Vec<SceneElement> {
+    let fallback = CursorImageStatus::default_named();
+    let status = if app.chrome_under().is_some() || app.surface_under().is_none() {
+        &fallback
+    } else {
+        &app.cursor_status
+    };
+    match status {
+        CursorImageStatus::Hidden => Vec::new(),
+        CursorImageStatus::Surface(surface) => {
+            let hotspot = with_states(surface, |state| {
+                state
+                    .data_map
+                    .get::<CursorImageSurfaceData>()
+                    .map(|data| data.lock().unwrap().hotspot)
+                    .unwrap_or_default()
+            });
+            render_elements_from_surface_tree::<
+                GlesRenderer,
+                WaylandSurfaceRenderElement<GlesRenderer>,
+            >(
+                renderer,
+                surface,
+                (app.pointer - hotspot.to_f64())
+                    .to_i32_round()
+                    .to_physical(app.scale),
+                app.scale as f64,
+                1.,
+                Kind::Cursor,
+            )
+            .into_iter()
+            .map(SceneElement::from)
+            .collect()
+        }
+        CursorImageStatus::Named(_) => {
+            // Dependency-free fallback arrow. Client cursor surfaces retain their own image/hotspot.
+            let mut result = Vec::new();
+            for row in 0..16 {
+                let width = if row < 11 { row + 1 } else { 4 };
+                if row > 1 && width > 2 {
+                    result.push(solid(
+                        Rect::new(
+                            app.pointer.x as f32 + 1.,
+                            app.pointer.y as f32 + row as f32,
+                            (width - 2) as f32,
+                            1.,
+                        ),
+                        [1., 1., 1., 1.],
+                        app.scale,
+                    ));
+                }
+                result.push(solid(
+                    Rect::new(
+                        app.pointer.x as f32,
+                        app.pointer.y as f32 + row as f32,
+                        width as f32,
+                        1.,
+                    ),
+                    [0., 0., 0., 1.],
+                    app.scale,
+                ));
+            }
+            result
+        }
+    }
+}
+
 fn backend_size(size: (i32, i32)) -> smithay::utils::Size<i32, smithay::utils::Physical> {
     size.into()
 }
@@ -1747,4 +1953,51 @@ fn solid(rect: Rect, color: [f32; 4], scale: i32) -> SceneElement {
         Kind::Unspecified,
     )
     .into()
+}
+
+#[cfg(test)]
+mod native_input_tests {
+    use super::*;
+
+    #[test]
+    fn pointer_motion_stays_inside_logical_output_and_rejects_nonfinite_coordinates() {
+        let size = (640, 400).into();
+        assert_eq!(
+            bounded_pointer((-200., 2000.).into(), size),
+            Some((0., 399.).into())
+        );
+        assert_eq!(
+            bounded_pointer((639., 399.).into(), size),
+            Some((639., 399.).into())
+        );
+        assert_eq!(bounded_pointer((f64::NAN, 0.).into(), size), None);
+        assert_eq!(bounded_pointer((0., f64::INFINITY).into(), size), None);
+    }
+
+    #[test]
+    fn vt_shortcuts_map_only_the_twelve_function_keys() {
+        use smithay::input::keyboard::xkb;
+        assert_eq!(vt_for_keysym(keysyms::KEY_F1), Some(1));
+        assert_eq!(vt_for_keysym(keysyms::KEY_F12), Some(12));
+        assert_eq!(vt_for_keysym(keysyms::KEY_F1 - 1), None);
+        assert_eq!(vt_for_keysym(keysyms::KEY_F13), None);
+        assert_eq!(vt_for_keysym(keysyms::KEY_a), None);
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("the same default XKB map as the seat");
+        let mut state = xkb::State::new(&keymap);
+        state.update_key(xkb::Keycode::new(37), xkb::KeyDirection::Down); // Left Ctrl.
+        state.update_key(xkb::Keycode::new(64), xkb::KeyDirection::Down); // Left Alt.
+        let translated = state.key_get_one_sym(xkb::Keycode::new(67)).raw(); // F1.
+        assert_eq!(translated, keysyms::KEY_XF86Switch_VT_1);
+        assert_eq!(vt_for_keysym(translated), Some(1));
+    }
 }
