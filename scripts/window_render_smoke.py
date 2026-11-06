@@ -96,7 +96,7 @@ def main():
             control = runtime / "control.sock"
             socket_name = "wayland-window-render"
             env.update(
-                XDG_RUNTIME_DIR=directory, XDG_DATA_HOME=str(data), XDG_DATA_DIRS=str(data),
+                XDG_RUNTIME_DIR=directory, XDG_CONFIG_HOME=str(runtime / "config"), XDG_DATA_HOME=str(data), XDG_DATA_DIRS=str(data),
                 AURA_CONTROL_SOCKET=str(control), AURA_WINIT_RESOLUTION="1024x640", AURA_OUTPUT_SCALE="1",
             )
             # Avoid inherited session capture producers introducing deliberate periodic frames.

@@ -49,6 +49,8 @@ jobs:
         run: python3 scripts/launcher_dock_smoke.py --no-build
       - name: Notification actions, desktop settings and layout shortcuts
         run: python3 scripts/desktop_controls_smoke.py --no-build
+      - name: Saved preferences and notification history
+        run: python3 scripts/preferences_history_smoke.py --no-build
       - name: Idle rendering, retained glass cache and window chrome
         run: python3 scripts/window_render_smoke.py --no-build
       - name: GPU pixel readback and GLES driver compilation
@@ -88,6 +90,7 @@ jobs:
             target/session-smoke-logs/
             target/launcher-dock-smoke-logs/
             target/desktop-controls-smoke-logs/
+            target/preferences-history-smoke-logs/
             target/window-render-smoke-logs/
             target/screencast-smoke-logs/
             target/driver-logs/

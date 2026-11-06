@@ -1,4 +1,5 @@
 //! Live session D-Bus services and compositor control transport.
+use crate::preferences::{PreferenceStore, Preferences};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader, Read, Write},
@@ -37,11 +38,16 @@ pub struct ShellState {
     pub do_not_disturb: bool,
     pub reduced_transparency: bool,
     pub notifications: BTreeMap<u32, Notification>,
+    pub history: crate::history::NotificationHistory,
     next_id: u32,
     next_generation: u64,
     intents: VecDeque<NotificationIntent>,
     // Serialize mutations with signal emission without holding the UI mutex across await.
     notification_gate: Arc<tokio::sync::Mutex<()>>,
+    preferences_enabled: bool,
+    preference_store: Option<PreferenceStore>,
+    persistence_error: String,
+    preference_gate: Arc<tokio::sync::Mutex<()>>,
 }
 #[derive(Debug)]
 enum NotificationIntent {
@@ -119,17 +125,18 @@ impl ShellState {
             .filter(|notification| notification.expires.is_some_and(|expiry| expiry <= now))
             .map(|notification| notification.id)
             .collect();
-        ids.into_iter()
-            .filter_map(|id| {
-                self.notifications
-                    .remove(&id)
-                    .map(|notification| NotificationEvent::Closed {
-                        id,
-                        owner: notification.owner,
-                        reason: 1,
-                    })
-            })
-            .collect()
+        let mut events = Vec::new();
+        for id in ids {
+            if let Some(notification) = self.notifications.remove(&id) {
+                self.history.archive(&notification, 1);
+                events.push(NotificationEvent::Closed {
+                    id,
+                    owner: notification.owner,
+                    reason: 1,
+                });
+            }
+        }
+        events
     }
     fn pending_events(&mut self, now: Instant) -> Vec<NotificationEvent> {
         // Enqueue already rejected expired cards. Honor accepted clicks before
@@ -161,7 +168,9 @@ impl ShellState {
                         key,
                     });
                     if !resident {
-                        self.notifications.remove(&id);
+                        if let Some(notification) = self.notifications.remove(&id) {
+                            self.history.archive(&notification, 2);
+                        }
                         events.push(NotificationEvent::Closed {
                             id,
                             owner,
@@ -170,7 +179,9 @@ impl ShellState {
                     }
                 }
                 NotificationIntent::Dismiss { .. } => {
-                    self.notifications.remove(&id);
+                    if let Some(notification) = self.notifications.remove(&id) {
+                        self.history.archive(&notification, 2);
+                    }
                     events.push(NotificationEvent::Closed {
                         id,
                         owner,
@@ -301,6 +312,122 @@ async fn command(command: String) -> zbus::fdo::Result<String> {
         .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?
         .map_err(zbus::fdo::Error::Failed)
 }
+// Settings use cancellable, bounded async transport on the service runtime.
+async fn settings_command(command: &str) -> Result<String, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    let operation = async {
+        let mut stream = tokio::net::UnixStream::connect(control_path()?)
+            .await
+            .map_err(|error| error.to_string())?;
+        stream
+            .write_all(format!("{command}\n").as_bytes())
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut response = String::new();
+        tokio::io::BufReader::new(stream)
+            .take(64 * 1024)
+            .read_line(&mut response)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !response.ends_with('\n') || response.starts_with("ERR") {
+            return Err("The compositor did not return a complete settings response".into());
+        }
+        Ok(response.trim().to_owned())
+    };
+    tokio::time::timeout(Duration::from_secs(1), operation)
+        .await
+        .map_err(|_| "The compositor settings request timed out".to_owned())?
+}
+
+async fn actual_preferences(state: &SharedState) -> Result<Preferences, String> {
+    let status = settings_command("status").await?;
+    let mut state = state.lock().unwrap();
+    let preferences = Preferences::from_status(&status, state.do_not_disturb)?;
+    state.reduced_transparency = preferences.glass_quality == "reduced-transparency";
+    Ok(preferences)
+}
+
+// The caller holds preference_gate until the I/O worker completes. A timed-out UI
+// request cannot release the gate and let a later snapshot overtake its write.
+async fn persist_preferences(state: &SharedState, actual: Preferences) -> Result<(), String> {
+    let (enabled, store, existing_error) = {
+        let state = state.lock().unwrap();
+        (
+            state.preferences_enabled,
+            state.preference_store.clone(),
+            state.persistence_error.clone(),
+        )
+    };
+    if !enabled {
+        return Ok(());
+    }
+    let result = match store {
+        Some(store) => tokio::task::spawn_blocking(move || store.save(&actual))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result),
+        None => Err(existing_error),
+    };
+    let mut state = state.lock().unwrap();
+    match result {
+        Ok(()) => {
+            state.persistence_error.clear();
+            Ok(())
+        }
+        Err(error) => {
+            let error =
+                format!("Settings applied for this session but could not be saved: {error}");
+            state.persistence_error = error.clone();
+            Err(error)
+        }
+    }
+}
+
+async fn restore_preferences(state: &SharedState) {
+    state.lock().unwrap().preferences_enabled = true;
+    let result = async {
+        let store = PreferenceStore::from_environment()?;
+        state.lock().unwrap().preference_store = Some(store.clone());
+        let loaded = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || store.load()),
+        )
+        .await
+        .map_err(|_| "Reading saved preferences timed out".to_owned())?
+        .map_err(|error| error.to_string())??;
+        let Some(saved) = loaded else {
+            return Ok::<_, String>(());
+        };
+        // DND is independent of compositor availability and can always be restored.
+        state.lock().unwrap().do_not_disturb = saved.do_not_disturb;
+        let mut errors = Vec::new();
+        for request in [
+            format!("layout {}", saved.layout),
+            format!("quality {}", saved.glass_quality),
+        ] {
+            match settings_command(&request).await {
+                Ok(response) if response == "OK" => {}
+                Ok(_) => errors.push("The compositor did not acknowledge saved settings".into()),
+                Err(error) => errors.push(error),
+            }
+        }
+        match actual_preferences(state).await {
+            Ok(actual) if actual == saved => {}
+            Ok(_) => errors.push("The compositor did not confirm the restored settings".into()),
+            Err(error) => errors.push(error),
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%error, "Saved preferences could not be restored");
+        state.lock().unwrap().persistence_error = error;
+    }
+}
 pub struct AuraShellService {
     pub state: SharedState,
 }
@@ -310,7 +437,30 @@ impl AuraShellService {
         if !["floating", "stage-manager", "tiling"].contains(&mode) {
             return Err(zbus::fdo::Error::InvalidArgs("Unknown layout mode".into()));
         }
-        command(format!("layout {mode}")).await
+        let gate = self.state.lock().unwrap().preference_gate.clone();
+        let _guard = gate.lock().await;
+        let response = settings_command(&format!("layout {mode}"))
+            .await
+            .map_err(zbus::fdo::Error::Failed)?;
+        if response != "OK" {
+            return Err(zbus::fdo::Error::Failed(
+                "The compositor did not acknowledge the settings change".into(),
+            ));
+        }
+        if self.state.lock().unwrap().preferences_enabled {
+            let actual = actual_preferences(&self.state)
+                .await
+                .map_err(zbus::fdo::Error::Failed)?;
+            if actual.layout != mode {
+                return Err(zbus::fdo::Error::Failed(
+                    "The requested layout was not confirmed by readback".into(),
+                ));
+            }
+            persist_preferences(&self.state, actual)
+                .await
+                .map_err(zbus::fdo::Error::Failed)?;
+        }
+        Ok(response)
     }
     async fn set_glass_quality(&self, preset: &str) -> zbus::fdo::Result<String> {
         if !["ultra", "balanced", "reduced-transparency"].contains(&preset) {
@@ -318,8 +468,30 @@ impl AuraShellService {
                 "Unknown quality preset".into(),
             ));
         }
-        let response = command(format!("quality {preset}")).await?;
+        let gate = self.state.lock().unwrap().preference_gate.clone();
+        let _guard = gate.lock().await;
+        let response = settings_command(&format!("quality {preset}"))
+            .await
+            .map_err(zbus::fdo::Error::Failed)?;
+        if response != "OK" {
+            return Err(zbus::fdo::Error::Failed(
+                "The compositor did not acknowledge the settings change".into(),
+            ));
+        }
         self.state.lock().unwrap().reduced_transparency = preset == "reduced-transparency";
+        if self.state.lock().unwrap().preferences_enabled {
+            let actual = actual_preferences(&self.state)
+                .await
+                .map_err(zbus::fdo::Error::Failed)?;
+            if actual.glass_quality != preset {
+                return Err(zbus::fdo::Error::Failed(
+                    "The requested quality was not confirmed by readback".into(),
+                ));
+            }
+            persist_preferences(&self.state, actual)
+                .await
+                .map_err(zbus::fdo::Error::Failed)?;
+        }
         Ok(response)
     }
     async fn focus_window(&self, id: u64) -> zbus::fdo::Result<String> {
@@ -333,8 +505,27 @@ impl AuraShellService {
         self.state.lock().unwrap().do_not_disturb
     }
     #[zbus(property)]
-    fn set_do_not_disturb(&self, value: bool) {
+    async fn set_do_not_disturb(&self, value: bool) -> zbus::fdo::Result<()> {
+        let gate = self.state.lock().unwrap().preference_gate.clone();
+        let _guard = gate.lock().await;
         self.state.lock().unwrap().do_not_disturb = value;
+        if self.state.lock().unwrap().preferences_enabled {
+            let actual = actual_preferences(&self.state)
+                .await
+                .map_err(zbus::fdo::Error::Failed)?;
+            persist_preferences(&self.state, actual)
+                .await
+                .map_err(zbus::fdo::Error::Failed)?;
+        }
+        Ok(())
+    }
+    #[zbus(property)]
+    fn preferences_enabled(&self) -> bool {
+        self.state.lock().unwrap().preferences_enabled
+    }
+    #[zbus(property)]
+    fn persistence_error(&self) -> String {
+        self.state.lock().unwrap().persistence_error.clone()
     }
 }
 pub struct NotificationService {
@@ -401,7 +592,12 @@ impl NotificationService {
                     "Only the notifying sender can close a notification".into(),
                 ));
             }
-            state.notifications.remove(&id).is_some()
+            if let Some(notification) = state.notifications.remove(&id) {
+                state.history.archive(&notification, 3);
+                true
+            } else {
+                false
+            }
         };
         if removed {
             let emitter = emitter.set_destination(
@@ -429,6 +625,14 @@ impl NotificationService {
 }
 /// Starts D-Bus services on a dedicated runtime and waits for registration.
 pub fn start_services(state: SharedState) -> Result<(), String> {
+    start_services_impl(state, false)
+}
+/// Restore and persist settings on the dedicated service runtime. Test/example
+/// callers can use start_services for an ephemeral session without config I/O.
+pub fn start_services_with_preferences(state: SharedState) -> Result<(), String> {
+    start_services_impl(state, true)
+}
+fn start_services_impl(state: SharedState, persistent: bool) -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Runtime::new() {
@@ -439,6 +643,9 @@ pub fn start_services(state: SharedState) -> Result<(), String> {
             }
         };
         runtime.block_on(async move {
+            if persistent {
+                restore_preferences(&state).await;
+            }
             let result = async {
                 zbus::connection::Builder::session()?
                     .name("org.aura.Shell1")?
@@ -534,6 +741,8 @@ mod tests {
             }]
         );
         assert!(state.notifications.contains_key(&first));
+        assert_eq!(state.history.entries().len(), 1);
+        assert_eq!(state.history.entries()[0].reason, 1);
     }
     #[test]
     fn malformed_actions_are_rejected_without_silent_truncation() {
@@ -591,6 +800,7 @@ mod tests {
             true,
             0,
         );
+        assert_eq!(state.lock().unwrap().history.entries().len(), 1);
         let generation = state.lock().unwrap().notifications[&resident].generation;
         assert!(enqueue_action(&state, resident, generation, "default"));
         assert_eq!(
@@ -602,6 +812,7 @@ mod tests {
             },]
         );
         assert!(state.lock().unwrap().notifications.contains_key(&resident));
+        assert_eq!(state.lock().unwrap().history.entries().len(), 1);
         assert!(enqueue_dismiss(&state, resident, generation));
         assert_eq!(
             state.lock().unwrap().pending_events(Instant::now()),
@@ -610,6 +821,16 @@ mod tests {
                 owner: ":1.2".into(),
                 reason: 2
             },]
+        );
+        assert_eq!(state.lock().unwrap().history.entries().len(), 2);
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .history
+                .entries()
+                .iter()
+                .all(|entry| entry.reason == 2)
         );
     }
     #[test]
@@ -644,6 +865,7 @@ mod tests {
                 .is_empty()
         );
         assert!(state.lock().unwrap().notifications.contains_key(&id));
+        assert!(state.lock().unwrap().history.entries().is_empty());
     }
     #[test]
     fn accepted_click_is_not_lost_to_the_next_expiry_poll() {

@@ -22,6 +22,8 @@ struct CompositorSettings {
 struct SettingsState {
     compositor: CompositorSettings,
     do_not_disturb: bool,
+    preferences_enabled: bool,
+    persistence_error: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Change {
@@ -129,6 +131,14 @@ async fn transact(change: Option<&Change>) -> Result<SettingsState, String> {
             .get_property("DoNotDisturb")
             .await
             .map_err(|error| error.to_string())?,
+        preferences_enabled: proxy
+            .get_property("PreferencesEnabled")
+            .await
+            .map_err(|error| error.to_string())?,
+        persistence_error: proxy
+            .get_property("PersistenceError")
+            .await
+            .map_err(|error| error.to_string())?,
     };
     if change.is_some_and(|change| !state.confirms(change)) {
         return Err("The requested setting was not confirmed by readback".into());
@@ -164,11 +174,13 @@ async fn refresh(
         }
         match result {
             Ok(state) => {
+                let persistence_error =
+                    (!state.persistence_error.is_empty()).then(|| state.persistence_error.clone());
                 current.state = Some(state);
                 if requested {
                     action_error = None;
                 }
-                current.error = action_error.clone();
+                current.error = persistence_error.or_else(|| action_error.clone());
             }
             Err(error) => {
                 if requested {
@@ -305,7 +317,17 @@ impl DesktopUi for SettingsUi {
     fn draw(&mut self, _: usize, canvas: &mut Canvas<'_>) {
         canvas.clear(0xff192534);
         canvas.text(24, 20, "Desktop settings", 0xfff0f5fc, 2);
-        canvas.text(24, 50, "Applies to the current Aura session", 0xffb8c8dc, 1);
+        let persistent = self
+            .current
+            .state
+            .as_ref()
+            .is_some_and(|state| state.preferences_enabled);
+        let scope = if persistent {
+            "Changes here are saved between Aura sessions"
+        } else {
+            "Applies to the current Aura session"
+        };
+        canvas.text(24, 50, scope, 0xffb8c8dc, 1);
         canvas.text(24, 68, "Window layout", 0xffd9e8f8, 1);
         canvas.text(24, 144, "Glass quality", 0xffd9e8f8, 1);
         canvas.text(24, 220, "Notifications", 0xffd9e8f8, 1);
@@ -361,7 +383,11 @@ impl DesktopUi for SettingsUi {
             canvas.text(x + 8, y + 14, label, 0xffedf3fc, 1);
         }
         let message = if self.pending.is_some() {
-            "Applying settings..."
+            if persistent {
+                "Applying and saving settings..."
+            } else {
+                "Applying settings..."
+            }
         } else if let Some(error) = &self.current.error {
             error
         } else if self.current.state.is_none() {
@@ -449,6 +475,8 @@ mod tests {
         let state = SettingsState {
             compositor,
             do_not_disturb: false,
+            preferences_enabled: true,
+            persistence_error: String::new(),
         };
         assert!(state.confirms(&Change::Layout("tiling")));
         assert!(!state.confirms(&Change::Layout("floating")));

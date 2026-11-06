@@ -4,6 +4,7 @@ use aura_shell::{
     client::{self, Canvas, DesktopUi, PanelSpec},
     desktop::{self, DesktopEntryItem},
     dock::{self, DockLayout},
+    history::{self, DetailHit, HistoryEntry, HistoryRow, ListHit},
     ipc::{self, SharedState},
     notifications::{self, Hit},
 };
@@ -33,6 +34,107 @@ enum Action {
     Launcher,
     Settings,
 }
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+enum NotificationView {
+    #[default]
+    Auto,
+    Hidden,
+    Active {
+        id: u32,
+        generation: u64,
+    },
+    History {
+        page: usize,
+        selected: usize,
+    },
+    Detail {
+        entry: HistoryEntry,
+        page: usize,
+        return_page: usize,
+        return_selected: usize,
+    },
+}
+#[derive(Clone)]
+enum DrawnHistory {
+    List {
+        rows: Vec<HistoryRow>,
+        page: usize,
+        selected: usize,
+    },
+    Detail {
+        entry: HistoryEntry,
+        page: usize,
+        return_page: usize,
+        return_selected: usize,
+    },
+}
+fn current_notification<'a>(
+    state: &'a ipc::ShellState,
+    view: &NotificationView,
+) -> Option<&'a ipc::Notification> {
+    match view {
+        NotificationView::Auto if !state.do_not_disturb => {
+            state.notifications.values().max_by_key(|n| n.generation)
+        }
+        NotificationView::Active { id, generation } => state
+            .notifications
+            .get(id)
+            .filter(|n| n.generation == *generation),
+        _ => None,
+    }
+}
+fn reconcile_view(view: &mut NotificationView, state: &ipc::ShellState, seen: &mut u64) {
+    let latest = state
+        .notifications
+        .values()
+        .map(|n| n.generation)
+        .max()
+        .unwrap_or(*seen);
+    if latest > *seen {
+        *seen = latest;
+        if matches!(view, NotificationView::Hidden) && !state.do_not_disturb {
+            *view = NotificationView::Auto;
+        }
+    }
+    if let NotificationView::Active { id, generation } = view {
+        if let Some(notification) = state.notifications.get(id) {
+            *generation = notification.generation;
+        } else {
+            *view = NotificationView::Auto;
+        }
+    }
+}
+/// Keyboard selection advances immediately, even when several keys precede a draw.
+/// Row identities still come from the last rendered snapshot and are revalidated on open.
+fn history_key(view: &mut NotificationView, rows: &[HistoryRow], key: u32) -> Option<ListHit> {
+    let NotificationView::History { page, selected } = view else {
+        return None;
+    };
+    *page = (*page).min(history::list_pages(rows) - 1);
+    *selected = (*selected).min(rows.len().saturating_sub(1));
+    let next = match key {
+        0xff1b => return Some(ListHit::Close),
+        0xff52 => selected.saturating_sub(1),
+        0xff54 => (*selected + 1).min(rows.len().saturating_sub(1)),
+        0xff51 => page.saturating_sub(1) * 6,
+        0xff53 => ((*page + 1).min(history::list_pages(rows) - 1)) * 6,
+        0xff0d | 0xff8d => {
+            return rows.get(*selected).map(|row| match row {
+                HistoryRow::Active { id, generation, .. } => ListHit::OpenActive {
+                    id: *id,
+                    generation: *generation,
+                },
+                HistoryRow::Archived(entry) => ListHit::OpenArchived {
+                    serial: entry.serial,
+                },
+            });
+        }
+        _ => return None,
+    };
+    *selected = next;
+    *page = next / 6;
+    None
+}
 struct Shell {
     state: SharedState,
     runtime: Arc<Mutex<RuntimeState>>,
@@ -47,10 +149,100 @@ struct Shell {
     redraw_fingerprint: Option<u64>,
     menu_width: u32,
     settings_rect: Option<dock::Rect>,
+    notification_menu_rect: Option<dock::Rect>,
+    notification_view: NotificationView,
+    latest_notification_seen: u64,
+    history_request_revision: u64,
+    drawn_history: Option<DrawnHistory>,
     notification_key: Option<(u32, u64)>,
     notification_page: usize,
     drawn_notification: Option<ipc::Notification>,
     drawn_notification_page: usize,
+}
+impl Shell {
+    fn history_hit(&mut self, hit: ListHit, page: usize, selected: usize) {
+        match hit {
+            ListHit::OpenActive { id, generation } => {
+                if self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .notifications
+                    .get(&id)
+                    .is_some_and(|n| n.generation == generation)
+                {
+                    self.notification_view = NotificationView::Active { id, generation };
+                }
+            }
+            ListHit::OpenArchived { serial } => {
+                if let Some(entry) = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .history
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.serial == serial)
+                    .cloned()
+                {
+                    self.notification_view = NotificationView::Detail {
+                        entry,
+                        page: 0,
+                        return_page: page,
+                        return_selected: selected,
+                    };
+                }
+            }
+            ListHit::Clear => {
+                self.state.lock().unwrap().history.clear();
+                self.notification_view = NotificationView::History {
+                    page: 0,
+                    selected: 0,
+                };
+            }
+            ListHit::Previous => {
+                self.notification_view = NotificationView::History {
+                    page: page.saturating_sub(1),
+                    selected: page.saturating_sub(1) * 6,
+                }
+            }
+            ListHit::Next => {
+                self.notification_view = NotificationView::History {
+                    page: page + 1,
+                    selected: (page + 1) * 6,
+                }
+            }
+            ListHit::Close => self.notification_view = NotificationView::Hidden,
+        }
+    }
+    fn detail_hit(&mut self, hit: DetailHit, drawn: DrawnHistory) {
+        let DrawnHistory::Detail {
+            entry,
+            page,
+            return_page,
+            return_selected,
+        } = drawn
+        else {
+            return;
+        };
+        self.notification_view = match hit {
+            DetailHit::Back => NotificationView::History {
+                page: return_page,
+                selected: return_selected,
+            },
+            DetailHit::Close => NotificationView::Hidden,
+            DetailHit::Previous | DetailHit::Next => NotificationView::Detail {
+                page: if hit == DetailHit::Previous {
+                    page.saturating_sub(1)
+                } else {
+                    (page + 1).min(history::detail_pages(&entry) - 1)
+                },
+                entry,
+                return_page,
+                return_selected,
+            },
+        };
+    }
 }
 impl DesktopUi for Shell {
     fn needs_redraw(&mut self) -> bool {
@@ -60,7 +252,6 @@ impl DesktopUi for Shell {
         self.catalog_revision = snapshot.revision;
         let mut hash = DefaultHasher::new();
         self.catalog_revision.hash(&mut hash);
-        self.notification_page.hash(&mut hash);
         self.dock_hover
             .map(|(x, y)| (x.to_bits(), y.to_bits()))
             .hash(&mut hash);
@@ -68,27 +259,23 @@ impl DesktopUi for Shell {
             let state = self.state.lock().unwrap();
             state.reduced_transparency.hash(&mut hash);
             state.do_not_disturb.hash(&mut hash);
-            state.notifications.len().hash(&mut hash);
-            if let Some(notification) = state.notifications.values().next_back() {
-                (
-                    &notification.app,
-                    &notification.summary,
-                    &notification.body,
-                    notification.generation,
-                )
-                    .hash(&mut hash);
-                for action in &notification.actions {
-                    (&action.key, &action.label).hash(&mut hash);
-                }
-                let key = Some((notification.id, notification.generation));
-                if self.notification_key != key {
-                    self.notification_key = key;
-                    self.notification_page = 0;
-                }
-            } else {
-                self.notification_key = None;
+            reconcile_view(
+                &mut self.notification_view,
+                &state,
+                &mut self.latest_notification_seen,
+            );
+            state.history.revision().hash(&mut hash);
+            for n in state.notifications.values() {
+                (n.id, n.generation).hash(&mut hash);
+            }
+            let notification = current_notification(&state, &self.notification_view);
+            let key = notification.map(|n| (n.id, n.generation));
+            if self.notification_key != key {
+                self.notification_key = key;
                 self.notification_page = 0;
             }
+            self.notification_view.hash(&mut hash);
+            self.notification_page.hash(&mut hash);
         }
         {
             let runtime = self.runtime.lock().unwrap();
@@ -114,31 +301,62 @@ impl DesktopUi for Shell {
         Some(std::time::Duration::from_millis(100))
     }
     fn supplemental_panels(&self) -> Vec<client::SupplementalPanel> {
-        let state = self.state.lock().unwrap();
-        if state.do_not_disturb || state.notifications.is_empty() {
-            Vec::new()
-        } else {
-            let revision = state.notifications.values().next_back().unwrap().generation;
-            vec![notifications::panel(revision)]
+        if matches!(
+            self.notification_view,
+            NotificationView::History { .. } | NotificationView::Detail { .. }
+        ) {
+            return vec![history::panel(self.history_request_revision)];
         }
+        let state = self.state.lock().unwrap();
+        current_notification(&state, &self.notification_view)
+            .map(|n| vec![notifications::panel(n.generation)])
+            .unwrap_or_default()
     }
+
     fn draw(&mut self, panel: usize, c: &mut Canvas<'_>) {
         if panel == 2 {
-            self.drawn_notification = self
-                .state
-                .lock()
-                .unwrap()
-                .notifications
-                .values()
-                .next_back()
-                .cloned();
-            if let Some(notification) = &self.drawn_notification {
-                self.drawn_notification_page = self
-                    .notification_page
-                    .min(notifications::pages(notification) - 1);
-                notifications::draw(notification, self.drawn_notification_page, c);
-            } else {
-                c.clear(0);
+            self.drawn_notification = None;
+            self.drawn_history = None;
+            let state = self.state.lock().unwrap();
+            match &self.notification_view {
+                NotificationView::History { page, selected } => {
+                    let rows = history::rows(&state.notifications, &state.history);
+                    let page = (*page).min(history::list_pages(&rows) - 1);
+                    let selected = (*selected).min(rows.len().saturating_sub(1));
+                    history::draw_list_selected(&rows, page, state.do_not_disturb, selected, c);
+                    self.drawn_history = Some(DrawnHistory::List {
+                        rows,
+                        page,
+                        selected,
+                    });
+                }
+                NotificationView::Detail {
+                    entry,
+                    page,
+                    return_page,
+                    return_selected,
+                } => {
+                    let page = (*page).min(history::detail_pages(entry) - 1);
+                    history::draw_detail(entry, page, c);
+                    self.drawn_history = Some(DrawnHistory::Detail {
+                        entry: entry.clone(),
+                        page,
+                        return_page: *return_page,
+                        return_selected: *return_selected,
+                    });
+                }
+                _ => {
+                    self.drawn_notification =
+                        current_notification(&state, &self.notification_view).cloned();
+                    if let Some(notification) = &self.drawn_notification {
+                        self.drawn_notification_page = self
+                            .notification_page
+                            .min(notifications::pages(notification) - 1);
+                        notifications::draw(notification, self.drawn_notification_page, c);
+                    } else {
+                        c.clear(0);
+                    }
+                }
             }
             return;
         }
@@ -160,13 +378,26 @@ impl DesktopUi for Shell {
             } else {
                 "Notifications"
             };
-            c.text(
-                c.width.saturating_sub(if sharing { 380 } else { 180 }) as i32,
-                10,
-                &format!("{label}: {}", state.notifications.len()),
-                0xffb8c8dc,
-                1,
-            );
+            let notification_x = c.width.saturating_sub(if sharing { 380 } else { 180 });
+            self.notification_menu_rect = (notification_x >= 484).then_some(dock::Rect {
+                x: notification_x as f32,
+                y: 4.,
+                width: 172.,
+                height: 24.,
+            });
+            if let Some(rect) = self.notification_menu_rect {
+                c.rect(rect.x as i32, 4, 172, 24, 0xff2a3c51);
+                c.text(
+                    rect.x as i32 + 4,
+                    12,
+                    &format!(
+                        "{label}: {}",
+                        state.notifications.len() + state.history.entries().len()
+                    ),
+                    0xffb8c8dc,
+                    1,
+                );
+            }
             let settings_x = c.width.saturating_sub(if sharing { 492 } else { 292 });
             self.settings_rect = (settings_x >= 372).then_some(dock::Rect {
                 x: settings_x as f32,
@@ -270,7 +501,7 @@ impl DesktopUi for Shell {
                 if state.do_not_disturb {
                     None
                 } else {
-                    state.notifications.values().next_back().cloned()
+                    current_notification(&state, &self.notification_view).cloned()
                 }
             };
             if let Some(n) = notification {
@@ -286,6 +517,46 @@ impl DesktopUi for Shell {
             self.dock_hover = None;
         }
     }
+    fn key(&mut self, key: u32, _: Option<&str>) -> bool {
+        match self.drawn_history.clone() {
+            Some(DrawnHistory::List { rows, .. })
+                if matches!(self.notification_view, NotificationView::History { .. }) =>
+            {
+                if let Some(hit) = history_key(&mut self.notification_view, &rows, key)
+                    && let NotificationView::History { page, selected } = self.notification_view
+                {
+                    self.history_hit(hit, page, selected);
+                }
+            }
+            Some(DrawnHistory::Detail { .. }) => {
+                if let NotificationView::Detail {
+                    entry,
+                    page,
+                    return_page,
+                    return_selected,
+                } = self.notification_view.clone()
+                {
+                    let hit = match key {
+                        0xff1b | 0xff08 => DetailHit::Back,
+                        0xff51 => DetailHit::Previous,
+                        0xff53 => DetailHit::Next,
+                        _ => return false,
+                    };
+                    self.detail_hit(
+                        hit,
+                        DrawnHistory::Detail {
+                            entry,
+                            page,
+                            return_page,
+                            return_selected,
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+        false
+    }
     fn pointer(&mut self, panel: usize, x: f64, y: f64, pressed: bool) {
         if panel == 1 {
             self.dock_hover = Some((x, y));
@@ -294,6 +565,28 @@ impl DesktopUi for Shell {
             return;
         }
         if panel == 2 {
+            if let Some(drawn) = self.drawn_history.clone() {
+                match &drawn {
+                    DrawnHistory::List {
+                        rows,
+                        page,
+                        selected,
+                    } if matches!(self.notification_view, NotificationView::History { .. }) => {
+                        if let Some(hit) = history::list_hit(rows, *page, x, y) {
+                            self.history_hit(hit, *page, *selected);
+                        }
+                    }
+                    DrawnHistory::Detail { entry, page, .. }
+                        if matches!(self.notification_view, NotificationView::Detail { .. }) =>
+                    {
+                        if let Some(hit) = history::detail_hit(entry, *page, x, y) {
+                            self.detail_hit(hit, drawn);
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
             if let Some(notification) = &self.drawn_notification
                 && self.notification_key == Some((notification.id, notification.generation))
             {
@@ -322,6 +615,24 @@ impl DesktopUi for Shell {
             return;
         }
         let action = if panel == 0 {
+            if self
+                .notification_menu_rect
+                .is_some_and(|rect| rect.contains(x, y))
+            {
+                self.notification_view = if matches!(
+                    self.notification_view,
+                    NotificationView::History { .. } | NotificationView::Detail { .. }
+                ) {
+                    NotificationView::Hidden
+                } else {
+                    self.history_request_revision = self.history_request_revision.wrapping_add(1);
+                    NotificationView::History {
+                        page: 0,
+                        selected: 0,
+                    }
+                };
+                return;
+            }
             if self.settings_rect.is_some_and(|rect| rect.contains(x, y)) {
                 let _ = self.actions.send(Action::Settings);
                 return;
@@ -406,7 +717,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = SharedState::default();
     state.lock().unwrap().reduced_transparency =
         std::env::var("AURA_GLASS_QUALITY").is_ok_and(|value| value == "reduced-transparency");
-    ipc::start_services(state.clone()).map_err(std::io::Error::other)?;
+    ipc::start_services_with_preferences(state.clone()).map_err(std::io::Error::other)?;
     let runtime = Arc::new(Mutex::new(RuntimeState::default()));
     let worker_state = runtime.clone();
     let (tx, rx) = mpsc::channel();
@@ -504,10 +815,154 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             redraw_fingerprint: None,
             menu_width: 0,
             settings_rect: None,
+            notification_menu_rect: None,
+            notification_view: NotificationView::Auto,
+            latest_notification_seen: 0,
+            history_request_revision: 0,
+            drawn_history: None,
             notification_key: None,
             notification_page: 0,
             drawn_notification: None,
             drawn_notification_page: 0,
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notification(id: u32, generation: u64) -> ipc::Notification {
+        ipc::Notification {
+            id,
+            generation,
+            owner: ":1.2".into(),
+            actions: Vec::new(),
+            resident: false,
+            app: "App".into(),
+            summary: "Message".into(),
+            body: "Body".into(),
+            expires: None,
+        }
+    }
+
+    #[test]
+    fn replacement_is_newest_and_explicit_history_can_open_an_older_live_card_in_dnd() {
+        let mut state = ipc::ShellState::default();
+        state.notifications.insert(1, notification(1, 3));
+        state.notifications.insert(2, notification(2, 2));
+        assert_eq!(
+            current_notification(&state, &NotificationView::Auto)
+                .unwrap()
+                .id,
+            1
+        );
+        state.do_not_disturb = true;
+        assert!(current_notification(&state, &NotificationView::Auto).is_none());
+        assert_eq!(
+            current_notification(
+                &state,
+                &NotificationView::Active {
+                    id: 2,
+                    generation: 2
+                }
+            )
+            .unwrap()
+            .id,
+            2
+        );
+        assert!(
+            current_notification(
+                &state,
+                &NotificationView::Active {
+                    id: 2,
+                    generation: 1
+                }
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn removing_newest_does_not_reopen_a_hidden_card_but_a_new_arrival_does() {
+        let mut state = ipc::ShellState::default();
+        state.notifications.insert(1, notification(1, 1));
+        let mut view = NotificationView::Hidden;
+        let mut seen = 2;
+        reconcile_view(&mut view, &state, &mut seen);
+        assert_eq!(view, NotificationView::Hidden);
+        assert_eq!(seen, 2);
+        state.notifications.insert(3, notification(3, 3));
+        reconcile_view(&mut view, &state, &mut seen);
+        assert_eq!(view, NotificationView::Auto);
+    }
+
+    #[test]
+    fn rapid_keyboard_selection_and_paging_accumulate_before_the_next_draw() {
+        let rows: Vec<_> = (1..=13)
+            .map(|id| HistoryRow::Active {
+                id,
+                generation: u64::from(id),
+                app: "App".into(),
+                summary: "Message".into(),
+            })
+            .collect();
+        let mut view = NotificationView::History {
+            page: 0,
+            selected: 0,
+        };
+        assert_eq!(history_key(&mut view, &rows, 0xff54), None);
+        assert_eq!(
+            history_key(&mut view, &rows, 0xff0d),
+            Some(ListHit::OpenActive {
+                id: 2,
+                generation: 2
+            })
+        );
+        history_key(&mut view, &rows, 0xff53);
+        history_key(&mut view, &rows, 0xff53);
+        assert_eq!(
+            history_key(&mut view, &rows, 0xff0d),
+            Some(ListHit::OpenActive {
+                id: 13,
+                generation: 13
+            })
+        );
+        assert_eq!(history_key(&mut view, &[], 0xff0d), None);
+        assert_eq!(history_key(&mut view, &[], 0xff1b), Some(ListHit::Close));
+    }
+
+    #[test]
+    fn new_arrivals_do_not_interrupt_history_and_selected_replacements_refresh_the_token() {
+        let mut state = ipc::ShellState::default();
+        state.notifications.insert(1, notification(1, 4));
+        let mut view = NotificationView::History {
+            page: 1,
+            selected: 7,
+        };
+        let mut seen = 1;
+        reconcile_view(&mut view, &state, &mut seen);
+        assert_eq!(
+            view,
+            NotificationView::History {
+                page: 1,
+                selected: 7
+            }
+        );
+        view = NotificationView::Active {
+            id: 1,
+            generation: 1,
+        };
+        reconcile_view(&mut view, &state, &mut seen);
+        assert_eq!(
+            view,
+            NotificationView::Active {
+                id: 1,
+                generation: 4
+            }
+        );
+        state.notifications.clear();
+        reconcile_view(&mut view, &state, &mut seen);
+        assert_eq!(view, NotificationView::Auto);
+    }
 }
