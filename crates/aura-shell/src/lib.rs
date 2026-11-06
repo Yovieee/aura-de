@@ -4,7 +4,8 @@ pub mod catalog;
 pub mod client;
 pub mod desktop;
 pub mod dock;
+pub mod history;
 pub mod ipc;
-pub mod settings;
-
 pub mod notifications;
+pub mod preferences;
+pub mod settings;

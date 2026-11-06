@@ -79,7 +79,7 @@ def main():
         with tempfile.TemporaryDirectory(prefix='aura-capture-smoke-') as directory:
             runtime = Path(directory)
             os.chmod(runtime, 0o700)
-            env.update(XDG_RUNTIME_DIR=directory, AURA_CONTROL_SOCKET=str(runtime / 'aura-control.sock'),
+            env.update(XDG_RUNTIME_DIR=directory, XDG_CONFIG_HOME=str(runtime / 'config'), AURA_CONTROL_SOCKET=str(runtime / 'aura-control.sock'),
                        AURA_WINIT_RESOLUTION='1024x640', AURA_OUTPUT_SCALE='1', PIPEWIRE_REMOTE='pipewire-0')
             daemon = launch('pipewire', ['pipewire'])
             wait_for(lambda: (runtime / 'pipewire-0').is_socket(), 'private PipeWire socket')

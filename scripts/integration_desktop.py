@@ -113,6 +113,7 @@ def main() -> int:
             if host_wayland and host_runtime and not os.path.isabs(host_wayland):
                 environment["WAYLAND_DISPLAY"] = str(Path(host_runtime) / host_wayland)
             environment["XDG_RUNTIME_DIR"] = directory
+            environment["XDG_CONFIG_HOME"] = str(runtime / "config")
             environment["AURA_WINIT_RESOLUTION"] = "1024x768"
             environment["AURA_OUTPUT_SCALE"] = "1"
             control = runtime / "aura-integration-control.sock"

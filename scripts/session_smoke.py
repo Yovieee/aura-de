@@ -75,7 +75,7 @@ def main():
             data=runtime/'data';applications=data/'applications';applications.mkdir(parents=True)
             marker=runtime/'application-launched'
             (applications/'aura-smoke-marker.desktop').write_text(f'[Desktop Entry]\nType=Application\nName=aurasmokemarker\nExec=/usr/bin/touch {marker}\n')
-            env.update(XDG_RUNTIME_DIR=directory,XDG_DATA_HOME=str(data),AURA_CONTROL_SOCKET=str(runtime/'aura-control.sock'),AURA_WINIT_RESOLUTION='1024x640',AURA_OUTPUT_SCALE='1')
+            env.update(XDG_RUNTIME_DIR=directory,XDG_CONFIG_HOME=str(runtime/'config'),XDG_DATA_HOME=str(data),AURA_CONTROL_SOCKET=str(runtime/'aura-control.sock'),AURA_WINIT_RESOLUTION='1024x640',AURA_OUTPUT_SCALE='1')
             session=subprocess.Popen([str(target/'aura-session'),'--socket','wayland-session-smoke','--no-portal'],cwd=ROOT,env=env,stdout=output,stderr=subprocess.STDOUT)
             control=runtime/'aura-control.sock'
             def status():
