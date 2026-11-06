@@ -6,6 +6,7 @@ set -euo pipefail
 prefix=/workspace/.cloud-setup/sysroot
 native=false
 testing=false
+xwayland=false
 dry_run=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -14,9 +15,10 @@ while [[ $# -gt 0 ]]; do
             prefix="$2"; shift 2 ;;
         --native) native=true; shift ;;
         --testing) testing=true; shift ;;
+        --xwayland) xwayland=true; shift ;;
         --dry-run) dry_run=true; shift ;;
         -h|--help)
-            echo "Usage: $0 [--prefix /workspace/.cloud-setup/sysroot] [--native] [--testing] [--dry-run]"
+            echo "Usage: $0 [--prefix /workspace/.cloud-setup/sysroot] [--native] [--testing] [--xwayland] [--dry-run]"
             echo "Debian 13 only. Downloads verified packages and extracts them without host installation."
             exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 2 ;;
@@ -57,6 +59,9 @@ if "$native"; then
 fi
 if "$testing"; then
     packages+=(xvfb xauth mesa-vulkan-drivers libgl1-mesa-dri dbus-x11 libglib2.0-bin wayland-utils libxtst6 pipewire-bin libpipewire-0.3-modules libspa-0.2-modules)
+fi
+if "$xwayland"; then
+    packages+=(xwayland x11-utils)
 fi
 if "$dry_run"; then
     printf 'Prefix: %s\nAPT state: %s\n' "$prefix" "$state_root"

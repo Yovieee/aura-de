@@ -29,6 +29,7 @@ winit = "0.30.13"
 [features]
 default = []
 native = ["smithay/backend_drm", "smithay/backend_gbm", "smithay/backend_libinput", "smithay/backend_session_libseat", "smithay/backend_udev", "smithay/renderer_multi"]
+xwayland = ["smithay/xwayland"]
 
 [dev-dependencies]
 wayland-client = { workspace = true }

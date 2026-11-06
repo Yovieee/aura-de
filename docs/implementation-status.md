@@ -8,7 +8,8 @@ Updated 2026-11-06. Aura is a **single-output development desktop**, with a test
 | --- | --- | --- |
 | Build baseline | Rust 1.99.1 pin, tracked lockfile, standalone core tests, default/native feature checks and separate native startup-failure gate | The CI workflow is configured; no remote CI run is claimed |
 | Pure core | Focus/visibility/restore/close invariants, bounded geometry, analytical stall-safe spring, finite/range material validation and fullscreen geometry policy; 22 standalone tests passed | Layout/physics remain independent of I/O and GPU |
-| Nested compositor | Real Wayland socket, SHM/xdg-shell, output/seat, keyboard/pointer, move/resize requests, clipboard focus, maximize, map/unmap/remap, popups, fullscreen and negotiated server-side decorations | One output; hardware DMA-BUF import, XWayland and comprehensive client-conformance coverage remain unfinished |
+| Nested compositor | Real Wayland socket, SHM/xdg-shell, output/seat, keyboard/pointer, move/resize requests, clipboard focus, maximize, map/unmap/remap, popups, fullscreen and negotiated server-side decorations | One output; hardware DMA-BUF import and comprehensive client-conformance coverage remain unfinished |
+| Optional XWayland | Opt-in rootless server/window manager; two real X11 windows rendered and received keyboard/pointer input, with mixed X11/Wayland clients, window-state/lifecycle checks and supervised display propagation | Initial software/SHM path. Broad application compatibility, cross-protocol clipboard/DnD and IME support are not established; shared D-Bus activation environment is unchanged |
 | Experimental native backend | Feature-gated DRM/GBM/EGL presentation, a single connector on one GPU, libseat ownership and pause/resume, libinput event dispatch, software cursor and VT requests share the compositor runtime; invalid device selections fail before socket publication | No physical KMS presentation, input, VT or hardware-performance evidence. Native ScreenCast is disabled; selected-output/device loss exits and requires restart. No multioutput or hotplug continuation |
 | Window lifecycle and chrome | Two real clients; focus/minimize/restore; repeated maximize; NULL unmap/new configure/remap; popup buffers/frame callbacks; fullscreen transitions and initial pre-map fullscreen with both client/server decorations; titlebar drag and traffic-light controls | Stage Manager is a layout mode, not full live-thumbnail/grouping UX; position springs render, while size transitions are not resampled animations |
 | Shell and launcher | Real layer-shell menu bar/Dock/overlay, exclusive reservation release/remap, live XDG application catalog, terminal entry launch, bounded D-Bus activation/Exec fallback, shell-free argv and magnified Dock app targets | Fixed bitmap font, text app tiles and one default output; settings are limited to layout/glass/DND |
@@ -25,23 +26,34 @@ Updated 2026-11-06. Aura is a **single-output development desktop**, with a test
 
 ## Current validation results
 
-The native phase passed 111 default Rust tests and 113 tests with all features;
-seven specialized tests remain intentionally ignored in each default command.
-All eight nested desktop integration harnesses and nine Xvfb startup tests
-passed. The native startup gate passed six cases and left both Wayland and
-control sockets unpublished. A separate surfaceless GLES test passed actual
-asymmetric scene/glass pixel checks for native and nested output transforms.
-None of these results establish physical KMS presentation, seat switching or
-native input on hardware.
+The XWayland integration gate passed actual X11 composed pixels and input,
+window state/lifecycle behavior, mixed-client rendering and Exec display
+propagation. It also verified host-socket preservation, private listener access,
+normal shutdown, XWayland crash cleanup and missing-executable failure. The final
+extended gate also passed initial pre-map maximization, Motif no-decoration
+geometry/pixels and rapid map/unmap/destroy without ghost windows, including
+startup under `umask 0`.
 
-CI includes both feature variants in checks/Clippy/tests, the native startup gate,
-the explicit GLES orientation test and the existing desktop gates. It uploads
+The XWayland phase passed 115 default Rust tests and 121 tests with all features;
+seven specialized tests remain intentionally ignored in both commands. All eight
+existing desktop harnesses also passed with the XWayland feature compiled and
+its runtime mode disabled. Formatting, all-target/all-feature checks and strict
+Clippy passed, and all nine Xvfb startup tests passed again. Bounded background
+metadata reads have deadline, cancellation and stale-generation tests; initial
+state reads do not block the compositor's frame/input handlers.
+Explicit driver and native-startup checks labeled below retain previous-phase
+evidence. None of these results establish physical KMS presentation, seat
+switching or native input on hardware.
+
+CI includes optional feature checks/Clippy/tests, the native startup gate, the
+explicit GLES orientation test, the existing desktop gates and the dedicated
+XWayland integration. It uploads `target/xwayland-smoke-logs`,
 `target/native-backend-smoke-logs`, `target/preferences-history-smoke-logs` and
 driver logs even on failure.
 
 Notification actions, session settings, keyboard shortcuts and host-focus recovery passed the private-display/private-bus integration. Gesture lifecycle tests use synthetic backend events; physical touchpad input remains unavailable through the current winit backend.
 
-Checks ran on Debian 13, Rust 1.99.1, Mesa 25.0.7 llvmpipe and PipeWire 1.4.2. Rootless setup extracted **85 SHA-256-verified Debian packages**; a clean activation resolved libclang, gdbus, PipeWire and native dependency metadata using the host-overlay sysroot. This prepares compilation/runtime dependencies and does not establish hardware support.
+Checks ran on Debian 13, Rust 1.99.1, Mesa 25.0.7 llvmpipe and PipeWire 1.4.2. The current rootless setup extracted **86 SHA-256-verified Debian packages**, including XWayland 24.1.6; a clean activation resolved libclang, gdbus, PipeWire and native dependency metadata using the host-overlay sysroot. This prepares compilation/runtime dependencies and does not establish hardware support.
 
 | Command or check | Result |
 | --- | --- |
@@ -49,11 +61,11 @@ Checks ran on Debian 13, Rust 1.99.1, Mesa 25.0.7 llvmpipe and PipeWire 1.4.2. R
 | `python3 scripts/verify_workspace.py` | Passed structural checks; no mathematical/runtime claim is inferred from this script |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo check --workspace --all-targets --all-features --locked` | Native implementation compiles; this does not establish KMS presentation or physical seat/input behavior |
-| `cargo clippy --workspace --all-targets --locked -- -D warnings` | Passed in the native phase |
-| `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | Passed in the native phase |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | Passed in the XWayland phase |
+| `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | Passed in the XWayland phase |
 | `cargo test -p aura-core --locked` | 22 passed, 0 failed |
-| `cargo test --workspace --locked` | **111 passed, 0 failed, 7 intentionally ignored** in the native phase. Zero-test binaries/doc-test runs are not counted as behavioral evidence |
-| `cargo test --workspace --all-features --locked` | **113 passed, 0 failed, 7 intentionally ignored**; two feature-gated tests cover page-flip deadlines and immediate VT-request render inhibition with bounded no-op recovery, without claiming hardware behavior |
+| `cargo test --workspace --locked` | **115 passed, 0 failed, 7 intentionally ignored** in the XWayland phase. Zero-test binaries/doc-test runs are not counted as behavioral evidence |
+| `cargo test --workspace --all-features --locked` | **121 passed, 0 failed, 7 intentionally ignored**; feature-gated tests cover safe X display allocation, metadata-worker deadlines/cancellation/stale generations and native page-flip/VT policies without claiming hardware behavior |
 | `cargo test -p aura-render --test gpu --locked -- --ignored --nocapture` | Previous phase: 1 passed; rendered pixels, blur/sharp comparison, clipping/premultiplication, opaque fallback and resize |
 | `cargo test -p aura-render --test gles --locked -- --ignored --nocapture` | Previous phase: 1 passed; canonical GLES3 and Smithay shader variants compiled/linked through an actual EGL driver |
 | Explicit compositor `capture::tests::gles_pbo_capture_preserves_pack_state_and_reads_composed_rows` with `--ignored --exact` | Passed again in the native phase; real asynchronous PBO readback, composed row order, pack-state preservation and revocation of queued work |
@@ -69,18 +81,36 @@ Checks ran on Debian 13, Rust 1.99.1, Mesa 25.0.7 llvmpipe and PipeWire 1.4.2. R
 | `python3 scripts/window_render_smoke.py --no-build` | Passed idle/cache counters, server-chrome minimize/restore, 64 px titlebar drag and close |
 | `python3 crates/aura-session/tests/pipewire_roundtrip.py` | Previous phase: passed 10 real PipeWire frames with exact 2×2 RGBA bytes, authenticated no-frame probe separation and node cleanup |
 | `python3 scripts/screencast_smoke.py --no-build` | Passed actual consent, compositor pixels over PipeWire, changed-scene checksums, Stop above fullscreen, fresh consent, explicit close, cancellation and disconnect cleanup |
-| `python3 scripts/native_backend_smoke.py` | Six passed: feature-disabled CLI/environment requests explain the required build; native-enabled missing, regular-file and non-DRM character-device selections fail before publishing sockets. `hardware_tested: false` |
-| Explicit compositor `native_render_tests::composites_glass_scene_for_native_and_nested_output_orientations` with `--ignored --exact` | Passed real surfaceless GLES pixels for both output transforms and retained scene reuse; no DRM device or physical display is exercised |
+| `python3 scripts/native_backend_smoke.py` | Previous native phase: six passed; feature-disabled CLI/environment requests explain the required build, and native-enabled missing/regular-file/non-DRM character-device selections fail before publishing sockets. `hardware_tested: false` |
+| `python3 scripts/xwayland_smoke.py --no-build` | Passed two real X11 composed colors, selected-window keyboard/pointer input, resize/maximize/fullscreen, pre-map maximization, Motif no-decoration geometry, rapid lifecycle without ghost windows, override-redirect geometry/input, mixed Wayland frames, actual Exec-launched X11 window/display, private socket/host preservation under permissive umask, shutdown/crash cleanup and missing-executable failure |
+| Explicit compositor `native_render_tests::composites_glass_scene_for_native_and_nested_output_orientations` with `--ignored --exact` | Previous native phase: passed real surfaceless GLES pixels for both output transforms and retained scene reuse; no DRM device or physical display is exercised |
 
-The five GPU/shader, private-bus and Unix-backlog checks labeled as previous-phase
-evidence retain their earlier results. PBO readback and the new orientation test
-passed explicitly for this phase. These seven tests remain ignored in the default
-commands because they require drivers, private buses or real sockets. CI runs
+The seven specialized GPU/shader, PBO/orientation, private-bus and Unix-backlog
+checks retain their earlier results and were not rerun for the XWayland phase.
+They remain ignored in the default commands because they require drivers,
+private buses or real sockets. CI runs
 them explicitly, builds real capture examples, preserves pipeline exit status
 and uploads artifacts. See [ScreenCast validation](screencast.md)
 for exact driver/socket commands.
 
 ## Retained runtime evidence
+
+`target/xwayland-smoke-logs/results.json` records two actual X11 windows with
+distinct composed colors, keyboard/pointer delivery to the selected window,
+client resize to 430×260 and fullscreen matching the output. An override-redirect
+popup renders and receives input at its requested geometry outside the managed
+layout. The gate minimizes/restores, unmaps/remaps and destroys managed windows,
+renders a real Wayland SHM client alongside them, and launches an X11 window
+through the Dock with the correct Aura `DISPLAY`. The host X socket inode is
+preserved; the new filesystem socket is mode `0600` and its abstract reservation
+does not accept clients. Normal shutdown and a fatal XWayland crash reap the
+server and remove owned sockets; a missing XWayland executable fails the session
+with cleanup. This is one integration gate, not a broad X11 conformance claim.
+The final extended gate confirmed initial maximization before map uses the work
+area and a Motif no-decoration hint leaves the 210-pixel client content height
+intact, with expected pixels and no server chrome. Three rapidly
+mapped/unmapped/destroyed windows leave no ghost model entries while the session
+remains alive. Startup under `umask 0` still produces the private socket mode.
 
 `target/native-backend-smoke-logs/results.json` records six startup failures,
 nonzero exits and unpublished Wayland/control sockets, with `hardware_tested`

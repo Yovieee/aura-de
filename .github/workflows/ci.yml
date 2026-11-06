@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install host dependencies
-        run: sudo bash scripts/install-deps.sh --native --testing
+        run: sudo bash scripts/install-deps.sh --native --testing --xwayland
       - name: Verify X11 keyboard runtime
         run: python3 -c 'import ctypes; ctypes.CDLL("libxkbcommon-x11.so.0")'
       - name: Verify virtual X11 startup and failure cleanup
@@ -88,6 +88,8 @@ jobs:
           python3 crates/aura-session/tests/pipewire_roundtrip.py 2>&1 | tee target/pipewire-roundtrip.log
       - name: ScreenCast consent, composed frames and revocation
         run: python3 scripts/screencast_smoke.py --no-build
+      - name: Rootless XWayland and mixed X11/Wayland clients
+        run: python3 scripts/xwayland_smoke.py
       - name: Save smoke logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -104,6 +106,7 @@ jobs:
             target/preferences-history-smoke-logs/
             target/window-render-smoke-logs/
             target/screencast-smoke-logs/
+            target/xwayland-smoke-logs/
             target/driver-logs/
             target/pipewire-roundtrip.log
             target/capture-connect.log

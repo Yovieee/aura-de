@@ -15,6 +15,12 @@ binary path overrides and startup timeout. It preserves the host display for
 winit and removes host display variables for the DRM child. Shell/application
 processes use Aura's Wayland socket after the compositor is ready.
 
+The optional `--xwayland` session mode additionally waits for its rootless X11
+server and window manager before starting the shell. Exec-launched applications
+receive that server's `DISPLAY`; the host display remains reserved for
+the nested compositor. The XWayland package and `aura-compositor/xwayland`
+feature are opt-in. See [XWayland setup](../docs/xwayland.md).
+
 Portal activation data belongs under `$prefix/share/dbus-1/services/` and
 `$prefix/share/xdg-desktop-portal/portals/`. Ensure the built `aura-session` binary
 is installed in PATH; package managers may replace Exec with an absolute path.

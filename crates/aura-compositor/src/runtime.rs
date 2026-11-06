@@ -103,9 +103,84 @@ use wayland_server::{
     protocol::{wl_buffer, wl_output::WlOutput, wl_seat::WlSeat, wl_surface::WlSurface},
 };
 
+#[cfg(feature = "xwayland")]
+#[path = "x11_windows.rs"]
+mod x11_windows;
+#[cfg(feature = "xwayland")]
+type KeyboardFocus = crate::xwayland::KeyboardFocus;
+#[cfg(not(feature = "xwayland"))]
+type KeyboardFocus = WlSurface;
+fn keyboard_focus_surface(focus: &KeyboardFocus) -> Option<WlSurface> {
+    #[cfg(feature = "xwayland")]
+    {
+        focus.wl_surface()
+    }
+    #[cfg(not(feature = "xwayland"))]
+    {
+        Some(focus.clone())
+    }
+}
+
+#[derive(Clone)]
+enum WindowSurface {
+    Xdg(ToplevelSurface),
+    #[cfg(feature = "xwayland")]
+    X11 {
+        window: smithay::xwayland::X11Surface,
+        surface: WlSurface,
+    },
+}
+impl WindowSurface {
+    fn wl_surface(&self) -> &WlSurface {
+        match self {
+            Self::Xdg(surface) => surface.wl_surface(),
+            #[cfg(feature = "xwayland")]
+            Self::X11 { surface, .. } => surface,
+        }
+    }
+    fn xdg(&self) -> Option<&ToplevelSurface> {
+        match self {
+            Self::Xdg(surface) => Some(surface),
+            #[cfg(feature = "xwayland")]
+            _ => None,
+        }
+    }
+    fn decoration_mode(&self) -> Option<DecorationMode> {
+        match self {
+            Self::Xdg(surface) => surface.current_state().decoration_mode,
+            #[cfg(feature = "xwayland")]
+            Self::X11 { window, .. } => {
+                (!window.is_decorated()).then_some(DecorationMode::ServerSide)
+            }
+        }
+    }
+    fn protocol(&self) -> &'static str {
+        match self {
+            Self::Xdg(_) => "wayland",
+            #[cfg(feature = "xwayland")]
+            Self::X11 { .. } => "x11",
+        }
+    }
+    fn send_close(&self) {
+        match self {
+            Self::Xdg(surface) => surface.send_close(),
+            #[cfg(feature = "xwayland")]
+            Self::X11 { window, .. } => {
+                if let Err(error) = window.close() {
+                    tracing::warn!(%error,"X11 close failed");
+                }
+            }
+        }
+    }
+}
+impl PartialEq<ToplevelSurface> for WindowSurface {
+    fn eq(&self, other: &ToplevelSurface) -> bool {
+        self.xdg().is_some_and(|surface| surface == other)
+    }
+}
 struct Toplevel {
     id: u64,
-    surface: ToplevelSurface,
+    surface: WindowSurface,
     mapped: bool,
     requested_fullscreen: bool,
 }
@@ -120,7 +195,7 @@ struct Command {
     response: mpsc::Sender<String>,
 }
 
-struct App {
+pub(crate) struct App {
     dh: wayland_server::DisplayHandle,
     compositor: CompositorState,
     xdg: XdgShellState,
@@ -148,7 +223,7 @@ struct App {
     pressed_pointer_buttons: HashSet<u32>,
     scale: i32,
     glass_ready: bool,
-    frame_dirty: bool,
+    pub(crate) frame_dirty: bool,
     scene_generation: u64,
     rendered_frames: u64,
     scene_captures: u64,
@@ -156,6 +231,20 @@ struct App {
     capture_available: bool,
     capture_subscribers: usize,
     capture_stop_requested: bool,
+    #[cfg(feature = "xwayland")]
+    pub(crate) xwayland_shell: smithay::wayland::xwayland_shell::XWaylandShellState,
+    #[cfg(feature = "xwayland")]
+    pub(crate) xwm: Option<smithay::xwayland::X11Wm>,
+    #[cfg(feature = "xwayland")]
+    pub(crate) xwayland_display: Option<u32>,
+    #[cfg(feature = "xwayland")]
+    pub(crate) xwayland_error: Option<String>,
+    #[cfg(feature = "xwayland")]
+    pub(crate) x11_metadata_worker: Option<crate::xwayland::initial_state::InitialStateWorker>,
+    #[cfg(feature = "xwayland")]
+    x11_pending: Vec<smithay::xwayland::X11Surface>,
+    #[cfg(feature = "xwayland")]
+    x11_overrides: Vec<smithay::xwayland::X11Surface>,
 }
 
 impl App {
@@ -210,6 +299,120 @@ impl App {
         self.layout_shortcut_keys = LayoutShortcutState::default();
         self.swipe = SwipeGestureState::default();
         self.drag = None;
+    }
+    fn xwayland_display_name(&self) -> Option<String> {
+        #[cfg(feature = "xwayland")]
+        {
+            self.xwayland_display
+                .filter(|_| self.xwayland_error.is_none())
+                .map(|display| format!(":{display}"))
+        }
+        #[cfg(not(feature = "xwayland"))]
+        {
+            None
+        }
+    }
+    fn keyboard_focus_for(&self, surface: Option<WlSurface>) -> Option<KeyboardFocus> {
+        #[cfg(feature = "xwayland")]
+        {
+            surface.map(|surface| {
+                if let Some(window) = self.toplevels.iter().find_map(|top| match &top.surface {
+                    WindowSurface::X11 {
+                        window,
+                        surface: associated,
+                    } if associated == &surface => Some(window.clone()),
+                    _ => None,
+                }) {
+                    return crate::xwayland::KeyboardFocus::X11 {
+                        window: Box::new(window),
+                        surface,
+                    };
+                }
+                surface.into()
+            })
+        }
+        #[cfg(not(feature = "xwayland"))]
+        {
+            surface
+        }
+    }
+    fn reconcile_toplevel_buffer(&mut self, surface: &WlSurface) {
+        let has_buffer =
+            with_renderer_surface_state(surface, |s| s.buffer().is_some()).unwrap_or(false);
+        if let Some(pos) = self
+            .toplevels
+            .iter()
+            .position(|t| t.surface.wl_surface() == surface)
+        {
+            let top = &mut self.toplevels[pos];
+            let id = top.id;
+            let was_mapped = top.mapped;
+            top.mapped = has_buffer;
+            let shell = top.surface.xdg().cloned();
+            let requested_fullscreen = top.requested_fullscreen;
+            #[cfg(feature = "xwayland")]
+            let requested_maximized =
+                matches!(&top.surface, WindowSurface::X11 { window, .. } if window.is_maximized());
+            if was_mapped && !has_buffer {
+                top.requested_fullscreen = false;
+            }
+            if has_buffer && !was_mapped {
+                let size = with_renderer_surface_state(surface, |s| s.buffer_size())
+                    .flatten()
+                    .unwrap_or_else(|| (640, 480).into());
+                let outer_height = size.h as f32;
+                #[cfg(feature = "xwayland")]
+                let outer_height = if matches!(&top.surface, WindowSurface::X11 { window, .. } if !window.is_decorated())
+                    && !requested_fullscreen
+                {
+                    outer_height + decorations::TITLEBAR_HEIGHT
+                } else {
+                    outer_height
+                };
+                self.model
+                    .map_xdg_window(id, "", "", (size.w as f32, outer_height));
+                self.model
+                    .workspace
+                    .set_fullscreen(id, requested_fullscreen);
+                #[cfg(feature = "xwayland")]
+                if requested_maximized && !requested_fullscreen {
+                    self.model
+                        .handle_traffic_light(id, TrafficLightAction::ToggleZoomFullscreen);
+                }
+                self.output.enter(surface);
+                if let Some(shell) = &shell {
+                    self.metadata(shell);
+                }
+                #[cfg(feature = "xwayland")]
+                if let WindowSurface::X11 { window, .. } = &self.toplevels[pos].surface {
+                    let window = window.clone();
+                    self.x11_metadata(&window);
+                }
+                self.focus(id);
+            } else if !has_buffer && was_mapped {
+                self.model.workspace.remove_window(id);
+                self.model.window_springs.remove(&id);
+                self.output.leave(surface);
+                self.drag = None;
+                self.sync_focus();
+            }
+            if let Some(shell) = shell
+                && !has_buffer
+                && !shell.is_initial_configure_sent()
+            {
+                let output = self.model.workspace.output_rect;
+                shell.with_pending_state(|s| {
+                    if requested_fullscreen && !was_mapped {
+                        s.states.set(xdg_toplevel::State::Fullscreen);
+                        s.size = Some((output.width as i32, output.height as i32).into());
+                    } else {
+                        s.states.unset(xdg_toplevel::State::Fullscreen);
+                        s.size = Some((640, 480).into());
+                    }
+                });
+                shell.send_configure();
+            }
+        }
     }
     fn apply_layout_gesture(&mut self, gesture: TouchpadSwipeGesture) {
         let mode = layout_mode_for_gesture(self.model.workspace.mode, gesture);
@@ -292,7 +495,7 @@ impl App {
             .map(|w| w.id)
     }
     fn server_decorated(&self, top: &Toplevel, flags: WindowStateFlags) -> bool {
-        decorations::is_server_side(top.surface.current_state().decoration_mode, flags)
+        decorations::is_server_side(top.surface.decoration_mode(), flags)
     }
     fn visual_rect(&self, node: &aura_core::WindowNode) -> Rect {
         self.model
@@ -307,11 +510,7 @@ impl App {
         for top in &self.toplevels {
             top.id.hash(&mut h);
             top.mapped.hash(&mut h);
-            top.surface
-                .current_state()
-                .decoration_mode
-                .map(|m| m as u32)
-                .hash(&mut h);
+            top.surface.decoration_mode().map(|m| m as u32).hash(&mut h);
             if let Some(node) = self
                 .model
                 .workspace
@@ -382,32 +581,52 @@ impl App {
     fn configure_windows(&mut self) {
         for node in self.model.workspace.windows() {
             if let Some(top) = self.toplevels.iter().find(|t| t.id == node.id) {
-                let desired_mode = top
-                    .surface
-                    .with_pending_state(|state| state.decoration_mode);
+                let desired_mode = top.surface.decoration_mode();
                 let content = decorations::content_rect(
                     node.computed_rect,
                     decorations::is_server_side(desired_mode, node.flags),
                 );
-                top.surface.with_pending_state(|state| {
-                    state.size =
-                        Some((content.width.round() as i32, content.height.round() as i32).into());
-                    for (flag, value) in [
-                        (WindowStateFlags::FOCUSED, xdg_toplevel::State::Activated),
-                        (WindowStateFlags::MAXIMIZED, xdg_toplevel::State::Maximized),
-                        (
-                            WindowStateFlags::FULLSCREEN,
-                            xdg_toplevel::State::Fullscreen,
-                        ),
-                    ] {
-                        if node.flags.contains(flag) {
-                            state.states.set(value);
-                        } else {
-                            state.states.unset(value);
+                if let Some(surface) = top.surface.xdg() {
+                    surface.with_pending_state(|state| {
+                        state.size = Some(
+                            (content.width.round() as i32, content.height.round() as i32).into(),
+                        );
+                        for (flag, value) in [
+                            (WindowStateFlags::FOCUSED, xdg_toplevel::State::Activated),
+                            (WindowStateFlags::MAXIMIZED, xdg_toplevel::State::Maximized),
+                            (
+                                WindowStateFlags::FULLSCREEN,
+                                xdg_toplevel::State::Fullscreen,
+                            ),
+                        ] {
+                            if node.flags.contains(flag) {
+                                state.states.set(value);
+                            } else {
+                                state.states.unset(value);
+                            }
                         }
+                    });
+                    surface.send_pending_configure();
+                }
+                #[cfg(feature = "xwayland")]
+                if let WindowSurface::X11 { window, .. } = &top.surface {
+                    let rect = smithay::utils::Rectangle::new(
+                        (content.x.round() as i32, content.y.round() as i32).into(),
+                        (
+                            (content.width.round() as i32).max(1),
+                            (content.height.round() as i32).max(1),
+                        )
+                            .into(),
+                    );
+                    if window.geometry() != rect {
+                        let _ = window.configure(rect);
                     }
-                });
-                top.surface.send_pending_configure();
+                    let _ = window.set_activated(node.flags.contains(WindowStateFlags::FOCUSED));
+                    let _ = window.set_maximized(node.flags.contains(WindowStateFlags::MAXIMIZED));
+                    let _ =
+                        window.set_fullscreen(node.flags.contains(WindowStateFlags::FULLSCREEN));
+                    let _ = window.set_suspended(node.flags.contains(WindowStateFlags::MINIMIZED));
+                }
             }
         }
     }
@@ -419,11 +638,11 @@ impl App {
                 self.toplevels.push(top);
                 self.seat.get_keyboard().unwrap().set_focus(
                     self,
-                    if self.host_focused {
+                    self.keyboard_focus_for(if self.host_focused {
                         self.exclusive_layer().or(Some(surface))
                     } else {
                         None
-                    },
+                    }),
                     SERIAL_COUNTER.next_serial(),
                 );
             }
@@ -444,11 +663,11 @@ impl App {
             .map(|t| t.surface.wl_surface().clone());
         self.seat.get_keyboard().unwrap().set_focus(
             self,
-            if self.host_focused {
+            self.keyboard_focus_for(if self.host_focused {
                 self.exclusive_layer().or(surface)
             } else {
                 None
-            },
+            }),
             SERIAL_COUNTER.next_serial(),
         );
         self.configure_windows();
@@ -499,6 +718,10 @@ impl App {
             }
         }
         drop(map);
+        #[cfg(feature = "xwayland")]
+        if let Some(surface) = self.x11_override_under() {
+            return Some(surface);
+        }
         for top in self.toplevels.iter().rev().filter(|t| t.mapped) {
             if let Some(node) = self
                 .model
@@ -562,6 +785,10 @@ impl App {
             }
         }
         drop(map);
+        #[cfg(feature = "xwayland")]
+        if self.x11_override_under().is_some() {
+            return None;
+        }
         for top in self.toplevels.iter().rev().filter(|t| t.mapped) {
             if let Some(node) = self
                 .model
@@ -625,6 +852,8 @@ impl App {
         let parts: Vec<_> = text.split_whitespace().collect();
         match parts.as_slice() {
             ["status"] => Ok(serde_json::json!({
+                "xwayland_display": self.xwayland_display_name(),
+                "xwayland_ready": self.xwayland_display_name().is_some(),
                 "backend": match self.backend { Backend::Winit=>"winit", Backend::Drm=>"drm" },
                 "layout": match self.model.workspace.mode { LayoutMode::Floating=>"floating",LayoutMode::StageManager=>"stage-manager",LayoutMode::DynamicTiling=>"tiling" },
                 "quality": if self.model.glass_material.kawase_blur_passes==0 {"reduced-transparency"} else if self.model.glass_material.chromatic_dispersion==0.0 {"balanced"} else {"ultra"},
@@ -633,7 +862,7 @@ impl App {
                 "reserved_top": self.model.workspace.menu_bar_height, "reserved_bottom":self.model.workspace.dock_reserved_height, "layers": self.layers.layer_surfaces().count(), "mapped_layers":self.layers.layer_surfaces().filter(|l|with_renderer_surface_state(l.wl_surface(),|s|s.buffer().is_some()).unwrap_or(false)).count(), "glass_active":self.glass_ready, "capture_available":self.capture_available,"capture_subscribers":self.capture_subscribers,
                 "rendered_frames":self.rendered_frames,"scene_captures":self.scene_captures,"blur_passes":self.blur_passes,"scene_generation":self.scene_generation
             }).to_string()),
-            ["windows"] => Ok(serde_json::Value::Array(self.model.workspace.windows().iter().map(|w| serde_json::json!({"id":w.id,"app_id":w.app_id,"title":w.title,"minimized":w.flags.contains(WindowStateFlags::MINIMIZED),"focused":w.flags.contains(WindowStateFlags::FOCUSED),"fullscreen":w.flags.contains(WindowStateFlags::FULLSCREEN),"maximized":w.flags.contains(WindowStateFlags::MAXIMIZED),"rect":{"x":w.computed_rect.x,"y":w.computed_rect.y,"width":w.computed_rect.width,"height":w.computed_rect.height}})).collect()).to_string()),
+            ["windows"] => Ok(serde_json::Value::Array(self.model.workspace.windows().iter().map(|w| serde_json::json!({"id":w.id,"protocol":self.toplevels.iter().find(|t|t.id==w.id).map(|t|t.surface.protocol()),"app_id":w.app_id,"title":w.title,"minimized":w.flags.contains(WindowStateFlags::MINIMIZED),"focused":w.flags.contains(WindowStateFlags::FOCUSED),"fullscreen":w.flags.contains(WindowStateFlags::FULLSCREEN),"maximized":w.flags.contains(WindowStateFlags::MAXIMIZED),"rect":{"x":w.computed_rect.x,"y":w.computed_rect.y,"width":w.computed_rect.width,"height":w.computed_rect.height}})).collect()).to_string()),
             ["layout", mode] => { self.model.set_layout_mode(match *mode { "floating"=>LayoutMode::Floating,"stage-manager"=>LayoutMode::StageManager,"tiling"=>LayoutMode::DynamicTiling,_=>return Err("invalid layout".into()) }); self.configure_windows(); Ok("OK".into()) }
             ["quality", quality] => { self.model.glass_material = aura_core::LiquidGlassMaterial::from_preset(match *quality { "ultra"=>GlassQualityPreset::Ultra,"balanced"=>GlassQualityPreset::Balanced,"reduced-transparency"=>GlassQualityPreset::ReducedTransparency,_=>return Err("invalid quality".into()) }); Ok("OK".into()) }
             [command @ ("focus"|"restore"|"minimize"|"close"), id] => {
@@ -692,14 +921,17 @@ impl ServerDndGrabHandler for App {
     fn send(&mut self, _: String, _: OwnedFd, _: Seat<Self>) {}
 }
 impl SeatHandler for App {
-    type KeyboardFocus = WlSurface;
+    type KeyboardFocus = KeyboardFocus;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seats
     }
-    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
-        set_data_device_focus(&self.dh, seat, focused.and_then(|s| s.client()));
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&KeyboardFocus>) {
+        let surface = focused.and_then(keyboard_focus_surface);
+        set_data_device_focus(&self.dh, seat, surface.as_ref().and_then(|s| s.client()));
+        #[cfg(feature = "xwayland")]
+        crate::xwayland::focus_changed(self, surface.as_ref());
     }
     fn cursor_image(&mut self, _: &Seat<Self>, status: CursorImageStatus) {
         self.cursor_status = status;
@@ -713,6 +945,10 @@ impl CompositorHandler for App {
         &mut self.compositor
     }
     fn client_compositor_state<'a>(&self, c: &'a Client) -> &'a CompositorClientState {
+        #[cfg(feature = "xwayland")]
+        if let Some(data) = c.get_data::<smithay::xwayland::XWaylandClientData>() {
+            return &data.compositor_state;
+        }
         &c.get_data::<ClientState>().unwrap().compositor
     }
     fn destroyed(&mut self, _surface: &WlSurface) {
@@ -740,53 +976,7 @@ impl CompositorHandler for App {
         self.popups.commit(surface);
         let has_buffer =
             with_renderer_surface_state(surface, |s| s.buffer().is_some()).unwrap_or(false);
-        if let Some(pos) = self
-            .toplevels
-            .iter()
-            .position(|t| t.surface.wl_surface() == surface)
-        {
-            let top = &mut self.toplevels[pos];
-            let id = top.id;
-            let was_mapped = top.mapped;
-            top.mapped = has_buffer;
-            let shell = top.surface.clone();
-            let requested_fullscreen = top.requested_fullscreen;
-            if was_mapped && !has_buffer {
-                top.requested_fullscreen = false;
-            }
-            if has_buffer && !was_mapped {
-                let size = with_renderer_surface_state(surface, |s| s.buffer_size())
-                    .flatten()
-                    .unwrap_or_else(|| (640, 480).into());
-                self.model
-                    .map_xdg_window(id, "", "", (size.w as f32, size.h as f32));
-                self.model
-                    .workspace
-                    .set_fullscreen(id, requested_fullscreen);
-                self.output.enter(surface);
-                self.metadata(&shell);
-                self.focus(id);
-            } else if !has_buffer && was_mapped {
-                self.model.workspace.remove_window(id);
-                self.model.window_springs.remove(&id);
-                self.output.leave(surface);
-                self.drag = None;
-                self.sync_focus();
-            }
-            if !has_buffer && !shell.is_initial_configure_sent() {
-                let output = self.model.workspace.output_rect;
-                shell.with_pending_state(|s| {
-                    if requested_fullscreen && !was_mapped {
-                        s.states.set(xdg_toplevel::State::Fullscreen);
-                        s.size = Some((output.width as i32, output.height as i32).into());
-                    } else {
-                        s.states.unset(xdg_toplevel::State::Fullscreen);
-                        s.size = Some((640, 480).into());
-                    }
-                });
-                shell.send_configure();
-            }
-        }
+        self.reconcile_toplevel_buffer(surface);
         if let Some(layer) = self
             .layers
             .layer_surfaces()
@@ -849,7 +1039,7 @@ impl XdgShellHandler for App {
         self.next_id += 1;
         self.toplevels.push(Toplevel {
             id,
-            surface,
+            surface: WindowSurface::Xdg(surface),
             mapped: false,
             requested_fullscreen: false,
         });
@@ -886,6 +1076,9 @@ impl XdgShellHandler for App {
             surface.send_popup_done();
             return;
         }
+        let Some(root) = self.keyboard_focus_for(Some(root)) else {
+            return;
+        };
         if let Ok(grab) = self.popups.grab_popup(root, popup, &self.seat, serial) {
             let keyboard = self.seat.get_keyboard().unwrap();
             keyboard.set_focus(self, grab.current_grab(), serial);
@@ -1198,6 +1391,20 @@ pub(crate) fn run(mut config: Config) -> Result<(), Box<dyn Error>> {
         capture_available: false,
         capture_subscribers: 0,
         capture_stop_requested: false,
+        #[cfg(feature = "xwayland")]
+        xwayland_shell: smithay::wayland::xwayland_shell::XWaylandShellState::new::<App>(&dh),
+        #[cfg(feature = "xwayland")]
+        xwm: None,
+        #[cfg(feature = "xwayland")]
+        xwayland_display: None,
+        #[cfg(feature = "xwayland")]
+        xwayland_error: None,
+        #[cfg(feature = "xwayland")]
+        x11_metadata_worker: None,
+        #[cfg(feature = "xwayland")]
+        x11_pending: Vec::new(),
+        #[cfg(feature = "xwayland")]
+        x11_overrides: Vec::new(),
     };
     app.model.socket_name = config.socket.clone();
     app.model.workspace.menu_bar_height = 0.;
@@ -1219,6 +1426,12 @@ pub(crate) fn run(mut config: Config) -> Result<(), Box<dyn Error>> {
         }
     })?;
     let _control = control_server(tx)?;
+    #[cfg(feature = "xwayland")]
+    let _xwayland = if config.xwayland {
+        Some(crate::xwayland::start(&dh, events.handle())?)
+    } else {
+        None
+    };
     tracing::info!(socket=%config.socket,backend=?config.backend,"Wayland server listening; GLES renderer active");
     let stop = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone())?;
@@ -1282,6 +1495,14 @@ pub(crate) fn run(mut config: Config) -> Result<(), Box<dyn Error>> {
         display.dispatch_clients(&mut app)?;
         app.popups.cleanup();
         events.dispatch(Duration::from_millis(8), &mut app)?;
+        #[cfg(feature = "xwayland")]
+        if let Some(error) = app.xwayland_error.take() {
+            return Err(error.into());
+        }
+        #[cfg(feature = "xwayland")]
+        if let Some(xwayland) = &_xwayland {
+            xwayland.check_startup(&app)?;
+        }
         let size = backend.size();
         if app.output.current_mode().is_none_or(|m| m.size != size) {
             app.resize(size);
@@ -1387,6 +1608,35 @@ pub(crate) fn run(mut config: Config) -> Result<(), Box<dyn Error>> {
                         ));
                         rendered.push(surface.wl_surface().clone());
                     }
+                }
+            }
+            #[cfg(feature = "xwayland")]
+            for window in app
+                .x11_overrides
+                .iter()
+                .rev()
+                .filter(|window| window.is_mapped())
+            {
+                if let Some(surface) = window.wl_surface()
+                    && with_renderer_surface_state(&surface, |state| state.buffer().is_some())
+                        .unwrap_or(false)
+                {
+                    scene.extend(
+                        render_elements_from_surface_tree::<
+                            GlesRenderer,
+                            WaylandSurfaceRenderElement<GlesRenderer>,
+                        >(
+                            renderer,
+                            &surface,
+                            window.geometry().loc.to_physical(config.scale),
+                            config.scale as f64,
+                            1.,
+                            Kind::Unspecified,
+                        )
+                        .into_iter()
+                        .map(SceneElement::from),
+                    );
+                    rendered.push(surface);
                 }
             }
             for top in app.toplevels.iter().rev().filter(|t| t.mapped) {
@@ -1740,7 +1990,7 @@ fn handle_input<B: InputBackend>(app: &mut App, event: InputEvent<B>) {
                         if interactive != KeyboardInteractivity::None {
                             app.seat.get_keyboard().unwrap().set_focus(
                                 app,
-                                app.exclusive_layer().or(Some(surface)),
+                                app.keyboard_focus_for(app.exclusive_layer().or(Some(surface))),
                                 SERIAL_COUNTER.next_serial(),
                             );
                         }
