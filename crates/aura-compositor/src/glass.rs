@@ -242,6 +242,12 @@ impl GlassRenderer {
         }
     }
 
+    /// A resumed output must not depend on retained presentation contents.
+    #[cfg(feature = "native")]
+    pub fn invalidate(&mut self) {
+        self.cache.invalidate();
+    }
+
     /// Capture the real client scene, blur it, then present glass and shell UI.
     /// Both element slices use Smithay front-to-back ordering. `scene` includes
     /// normal windows, compositor chrome and bottom/background layers;
@@ -261,6 +267,7 @@ impl GlassRenderer {
         renderer: &mut GlesRenderer,
         target: &mut GlesTarget<'_>,
         size: Size<i32, Physical>,
+        output_transform: Transform,
         scale: f64,
         scene_generation: u64,
         scene: &[E],
@@ -273,6 +280,7 @@ impl GlassRenderer {
             renderer,
             target,
             size,
+            output_transform,
             scale,
             scene_generation,
             scene,
@@ -293,6 +301,7 @@ impl GlassRenderer {
         renderer: &mut GlesRenderer,
         target: &mut GlesTarget<'_>,
         size: Size<i32, Physical>,
+        output_transform: Transform,
         scale: f64,
         scene_generation: u64,
         scene: &[E],
@@ -363,8 +372,8 @@ impl GlassRenderer {
         } else {
             &self.buffers.scene
         };
-        // winit presentation uses Flipped180, matching its surface orientation.
-        let mut frame = renderer.render(target, size, Transform::Flipped180)?;
+        // Keep GBM scanout and nested EGL surface orientation explicit.
+        let mut frame = renderer.render(target, size, output_transform)?;
         frame.clear(clear, &[damage])?;
         texture(&mut frame, &self.buffers.scene, size, None, &[])?;
         for uniform in uniforms.into_iter().rev() {

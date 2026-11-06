@@ -6,6 +6,11 @@ This is a nested, single-output development desktop. It includes Wayland client 
 
 This is development software, with no claim of a working native DRM/KMS session. ScreenCast is limited to a single monitor, hidden cursor and fixed-size SDR RGBA frames, at most 4096 pixels per axis. Resizing ends the stream and requires fresh selection/consent. Hardware performance, zero-copy capture, HDR and multioutput are not established.
 
+An optional experimental DRM/KMS backend shares the compositor and shell with
+the nested path. It uses libseat, GBM/EGL and libinput, but still requires target
+hardware validation. The default session remains nested. See the
+[native backend build, launch and validation notes](docs/native-backend.md).
+
 ## Screenshots
 
 Captured from a running nested session with Mesa software rendering. The windows, launcher entries and notifications shown here are development samples.

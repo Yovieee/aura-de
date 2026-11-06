@@ -16,12 +16,14 @@ use tokio::{
 use tracing::{info, warn};
 
 pub const HELP: &str = "Aura session supervisor\n\
-Usage: aura-session [--backend winit] [--socket NAME] [--compositor PATH] [--shell PATH]\n\
+Usage: aura-session [--backend winit|drm] [--socket NAME] [--compositor PATH] [--shell PATH]\n\
                     [--no-shell] [--no-portal] [--startup-timeout SECONDS]\n\
        aura-session --portal\n\
 \nStarts a compositor, waits for its Wayland socket, then starts the shell.\n\
 SIGINT/SIGTERM or a child exiting stops and reaps the session's process groups.\n\
 If there is no session bus, dbus-run-session creates one.\n\
+The default winit backend uses an existing graphical desktop. Experimental drm\n\
+requires a compositor built with --features native and an accessible Linux seat.\n\
 ScreenCast requires this session's authenticated capture source, a running PipeWire daemon,\n\
 and explicit approval in the screen-sharing consent overlay. Standalone --portal\n\
 does not inherit screen capture capabilities.";
@@ -80,8 +82,8 @@ impl Options {
         if !options.portal_only {
             validate_socket_name(&options.socket)?;
         }
-        if !options.portal_only && options.backend != "winit" {
-            return Err(invalid("only the winit backend is currently implemented"));
+        if !options.portal_only && !matches!(options.backend.as_str(), "winit" | "drm") {
+            return Err(invalid("unknown backend; choose winit or drm"));
         }
         Ok(ParseResult::Run(options))
     }
@@ -308,7 +310,14 @@ pub async fn run(options: Options) -> io::Result<()> {
             .env_remove("AURA_CAPTURE_TOKEN")
             .env_remove("AURA_CAPTURE_OWNER_PID");
     }
-    // Preserve host WAYLAND_DISPLAY/DISPLAY for winit. Only clients get the new socket.
+    // The native presenter obtains its mode from DRM and never needs a nested
+    // host display. Clients below always receive the new Wayland socket.
+    if options.backend == "drm" {
+        compositor_command
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("DISPLAY")
+            .env_remove("AURA_WINIT_RESOLUTION");
+    }
     let mut compositor = ManagedChild::spawn("aura-compositor", &mut compositor_command)?;
     let ready = tokio::select! {
         result = wait_for_socket(&mut compositor, &socket, options.startup_timeout) => result,
@@ -458,6 +467,10 @@ mod tests {
         assert_eq!(options.socket, "wayland-test-1");
         assert!(options.shell.is_none());
         assert!(!options.portal);
+        let ParseResult::Run(options) = parse(&["--backend", "drm"]).unwrap() else {
+            panic!("run expected")
+        };
+        assert_eq!(options.backend, "drm");
     }
 
     #[tokio::test]

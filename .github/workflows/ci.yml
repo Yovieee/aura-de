@@ -34,8 +34,14 @@ jobs:
         run: cargo check --workspace --all-targets --all-features --locked
       - name: Lint
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Lint optional native backend
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Run Rust tests
         run: cargo test --workspace --locked
+      - name: Test optional native backend policies
+        run: cargo test --workspace --all-features --locked
+      - name: Native feature selection and fail-closed startup
+        run: python3 scripts/native_backend_smoke.py
       - name: Build real integration clients and capture consumers
         run: |
           cargo build --workspace --bins --examples --locked
@@ -63,6 +69,10 @@ jobs:
         run: |
           set -o pipefail
           LIBGL_ALWAYS_SOFTWARE=1 EGL_PLATFORM=surfaceless cargo test -p aura-compositor --bin aura-compositor capture::tests::gles_pbo_capture_preserves_pack_state_and_reads_composed_rows --locked -- --ignored --exact --nocapture 2>&1 | tee target/driver-logs/pbo.log
+      - name: Native and nested framebuffer orientation
+        run: |
+          set -o pipefail
+          LIBGL_ALWAYS_SOFTWARE=1 EGL_PLATFORM=surfaceless cargo test -p aura-compositor --bin aura-compositor native_render_tests::composites_glass_scene_for_native_and_nested_output_orientations --locked -- --ignored --exact --nocapture 2>&1 | tee target/driver-logs/native-orientation.log
       - name: Private D-Bus services
         run: |
           dbus-run-session -- cargo test -p aura-session portal_dbus_lifecycle --locked -- --ignored
@@ -86,6 +96,7 @@ jobs:
           path: |
             target/smoke-logs/
             target/xvfb-logs/
+            target/native-backend-smoke-logs/
             target/desktop-smoke-logs/
             target/session-smoke-logs/
             target/launcher-dock-smoke-logs/

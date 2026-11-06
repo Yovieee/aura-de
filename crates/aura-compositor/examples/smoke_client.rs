@@ -11,10 +11,10 @@ use std::{
 
 use smithay::reexports::rustix::event::{PollFd, PollFlags, Timespec, poll};
 use wayland_client::{
-    Connection, Dispatch, QueueHandle, WEnum, delegate_noop,
+    Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop,
     protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool,
-        wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm,
+        wl_shm_pool, wl_surface,
     },
 };
 use wayland_protocols::xdg::decoration::zv1::client::{
@@ -36,6 +36,7 @@ struct Options {
     exercise_fullscreen: bool,
     start_fullscreen: bool,
     decoration_mode: Option<DecorationMode>,
+    observe_pointer: bool,
 }
 
 impl Options {
@@ -50,6 +51,7 @@ impl Options {
             exercise_fullscreen: false,
             start_fullscreen: false,
             decoration_mode: None,
+            observe_pointer: false,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -67,6 +69,7 @@ impl Options {
                 "--exercise-popup" => options.exercise_popup = true,
                 "--exercise-fullscreen" => options.exercise_fullscreen = true,
                 "--start-fullscreen" => options.start_fullscreen = true,
+                "--observe-pointer" => options.observe_pointer = true,
                 "--decoration-mode" => {
                     options.decoration_mode = Some(match args.next().as_deref() {
                         Some("server") => DecorationMode::ServerSide,
@@ -76,7 +79,7 @@ impl Options {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "smoke_client [--frames N (>=2)] [--title TITLE] [--stay] [--idle-on-ready] [--exercise-lifecycle] [--exercise-popup] [--exercise-fullscreen | --start-fullscreen] [--decoration-mode server|client]"
+                        "smoke_client [--frames N (>=2)] [--title TITLE] [--stay] [--idle-on-ready] [--exercise-lifecycle] [--exercise-popup] [--exercise-fullscreen | --start-fullscreen] [--decoration-mode server|client] [--observe-pointer]"
                     );
                     std::process::exit(0);
                 }
@@ -172,6 +175,8 @@ struct State {
     shm: Option<wl_shm::WlShm>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     output: Option<wl_output::WlOutput>,
+    seat: Option<wl_seat::WlSeat>,
+    pointer: Option<wl_pointer::WlPointer>,
     output_size: Option<(i32, i32)>,
     output_scale: i32,
     decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
@@ -208,6 +213,8 @@ impl State {
             shm: None,
             wm_base: None,
             output: None,
+            seat: None,
+            pointer: None,
             output_size: None,
             output_scale: 1,
             decoration_manager: None,
@@ -633,6 +640,16 @@ impl State {
     }
 
     fn cleanup(&mut self) {
+        if let Some(pointer) = self.pointer.take()
+            && pointer.version() >= 3
+        {
+            pointer.release();
+        }
+        if let Some(seat) = self.seat.take()
+            && seat.version() >= 5
+        {
+            seat.release();
+        }
         // Destroy popup role/surface before its parent xdg_toplevel.
         if let Some(popup) = self.popup.take() {
             popup.role.destroy();
@@ -697,6 +714,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 "wl_output" if state.output.is_none() => {
                     state.output = Some(registry.bind(name, version.min(2), qh, ()));
                 }
+                "wl_seat" if state.options.observe_pointer && state.seat.is_none() => {
+                    state.seat = Some(registry.bind(name, version.min(5), qh, ()));
+                }
                 "zxdg_decoration_manager_v1" if state.decoration_manager.is_none() => {
                     state.decoration_manager = Some(registry.bind(name, 1, qh, ()));
                 }
@@ -704,6 +724,51 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             }
             state.initialize(qh);
         }
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for State {
+    fn event(
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(capabilities),
+        } = event
+            && capabilities.contains(wl_seat::Capability::Pointer)
+            && state.pointer.is_none()
+        {
+            state.pointer = Some(seat.get_pointer(qh, ()));
+        }
+    }
+}
+
+impl Dispatch<wl_pointer::WlPointer, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &wl_pointer::WlPointer,
+        event: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_pointer::Event::Enter { .. } => println!("POINTER_ENTER"),
+            wl_pointer::Event::Leave { .. } => println!("POINTER_LEAVE"),
+            wl_pointer::Event::Button {
+                button,
+                state: WEnum::Value(state),
+                ..
+            } => {
+                println!("POINTER_BUTTON button={button} state={state:?}");
+            }
+            _ => return,
+        }
+        let _ = std::io::stdout().flush();
     }
 }
 
