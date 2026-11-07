@@ -9,6 +9,7 @@ use std::{
 
 use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
     process::{Child, Command},
     time::{Instant, sleep, timeout},
@@ -17,13 +18,15 @@ use tracing::{info, warn};
 
 pub const HELP: &str = "Aura session supervisor\n\
 Usage: aura-session [--backend winit|drm] [--socket NAME] [--compositor PATH] [--shell PATH]\n\
-                    [--no-shell] [--no-portal] [--startup-timeout SECONDS]\n\
+                    [--no-shell] [--no-portal] [--xwayland] [--startup-timeout SECONDS]\n\
        aura-session --portal\n\
 \nStarts a compositor, waits for its Wayland socket, then starts the shell.\n\
 SIGINT/SIGTERM or a child exiting stops and reaps the session's process groups.\n\
 If there is no session bus, dbus-run-session creates one.\n\
 The default winit backend uses an existing graphical desktop. Experimental drm\n\
 requires a compositor built with --features native and an accessible Linux seat.\n\
+Optional --xwayland (or AURA_XWAYLAND=1) requires an XWayland-enabled compositor.\n\
+The shell starts after its X11 display is ready; --no-xwayland disables it.\n\
 ScreenCast requires this session's authenticated capture source, a running PipeWire daemon,\n\
 and explicit approval in the screen-sharing consent overlay. Standalone --portal\n\
 does not inherit screen capture capabilities.";
@@ -37,6 +40,7 @@ pub struct Options {
     pub shell: Option<OsString>,
     pub portal: bool,
     pub startup_timeout: Duration,
+    pub xwayland: bool,
 }
 
 pub enum ParseResult {
@@ -56,6 +60,11 @@ impl Options {
             shell: Some(sibling_or_path("aura-shell")),
             portal: true,
             startup_timeout: Duration::from_secs(15),
+            xwayland: match std::env::var("AURA_XWAYLAND").as_deref() {
+                Err(std::env::VarError::NotPresent) | Ok("0") => false,
+                Ok("1") => true,
+                _ => return Err(invalid("AURA_XWAYLAND must be 0 or 1")),
+            },
         };
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -67,6 +76,8 @@ impl Options {
                 "--shell" => options.shell = Some(value(&mut args, &arg)?.into()),
                 "--no-shell" => options.shell = None,
                 "--no-portal" => options.portal = false,
+                "--xwayland" => options.xwayland = true,
+                "--no-xwayland" => options.xwayland = false,
                 "--startup-timeout" => {
                     let seconds: u64 = value(&mut args, &arg)?.parse().map_err(|_| {
                         invalid("startup timeout must be an integer between 1 and 300")
@@ -251,6 +262,106 @@ async fn wait_for_socket(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct XwaylandStatus {
+    xwayland_ready: bool,
+    xwayland_display: Option<String>,
+}
+
+fn xwayland_display(response: &str) -> io::Result<Option<String>> {
+    let status: XwaylandStatus = serde_json::from_str(response)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if !status.xwayland_ready {
+        return Ok(None);
+    }
+    let display = status.xwayland_display.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "XWayland is ready without a display",
+        )
+    })?;
+    if !display.strip_prefix(':').is_some_and(|number| {
+        !number.is_empty()
+            && number.bytes().all(|byte| byte.is_ascii_digit())
+            && number.parse::<u32>().is_ok()
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the compositor returned an invalid local XWayland display",
+        ));
+    }
+    Ok(Some(display))
+}
+
+async fn query_xwayland(control: &Path, deadline: Duration) -> io::Result<Option<String>> {
+    timeout(deadline, async {
+        let mut stream = UnixStream::connect(control).await?;
+        stream.write_all(b"status\n").await?;
+        let mut response = String::new();
+        BufReader::new(stream)
+            .take(64 * 1024 + 1)
+            .read_line(&mut response)
+            .await?;
+        if response.len() > 64 * 1024 || !response.ends_with('\n') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the compositor did not return a bounded, complete status response",
+            ));
+        }
+        xwayland_display(&response)
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the compositor XWayland status query timed out",
+        )
+    })?
+}
+
+async fn wait_for_xwayland(
+    child: &mut ManagedChild,
+    control: &Path,
+    startup_timeout: Duration,
+) -> io::Result<String> {
+    let deadline = Instant::now() + startup_timeout;
+    loop {
+        if let Some(status) = child.child.try_wait()? {
+            return Err(io::Error::other(format!(
+                "{} exited before XWayland was ready: {status}",
+                child.name
+            )));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "XWayland was not ready within {}s",
+                    startup_timeout.as_secs_f32()
+                ),
+            ));
+        }
+        match query_xwayland(control, remaining.min(Duration::from_millis(250))).await {
+            Ok(Some(display)) => return Ok(display),
+            Ok(None) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::ConnectionRefused
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        sleep(Duration::from_millis(30).min(deadline.saturating_duration_since(Instant::now())))
+            .await;
+    }
+}
+
 struct Shutdown {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
@@ -280,6 +391,9 @@ pub async fn run(options: Options) -> io::Result<()> {
     let mut shutdown = Shutdown::new()?;
     let runtime = RuntimeDirectory::prepare(std::env::var_os("XDG_RUNTIME_DIR"))?;
     let socket = runtime.path.join(&options.socket);
+    let control = std::env::var_os("AURA_CONTROL_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime.path.join("aura-control.sock"));
     if std::fs::symlink_metadata(&socket).is_ok() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -297,8 +411,14 @@ pub async fn run(options: Options) -> io::Result<()> {
     compositor_command
         .args(["--backend", &options.backend, "--socket", &options.socket])
         .env("XDG_RUNTIME_DIR", &runtime.path)
+        .env("AURA_CONTROL_SOCKET", &control)
         .env("AURA_WAYLAND_DISPLAY", &options.socket)
         .env("XDG_CURRENT_DESKTOP", "Aura");
+    compositor_command.arg(if options.xwayland {
+        "--xwayland"
+    } else {
+        "--no-xwayland"
+    });
     if let Some(capture) = &capture {
         compositor_command
             .env("AURA_CAPTURE_SOCKET", &capture.socket)
@@ -329,17 +449,40 @@ pub async fn run(options: Options) -> io::Result<()> {
     }
     info!(socket = %socket.display(), "Wayland compositor is accepting connections");
 
+    let x_display = if options.xwayland {
+        let ready = tokio::select! {
+            result = wait_for_xwayland(&mut compositor, &control, options.startup_timeout) => result,
+            () = shutdown.wait() => { compositor.stop().await; return Ok(()); }
+        };
+        match ready {
+            Ok(x_display_name) => {
+                info!(x_display = %x_display_name, "XWayland window manager is ready");
+                Some(x_display_name)
+            }
+            Err(error) => {
+                compositor.stop().await;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+
     let mut shell = if let Some(program) = options.shell {
         let mut command = Command::new(program);
         command
             .env("XDG_RUNTIME_DIR", &runtime.path)
             .env("WAYLAND_DISPLAY", &options.socket)
             .env("AURA_WAYLAND_DISPLAY", &options.socket)
+            .env("AURA_CONTROL_SOCKET", &control)
             .env("XDG_CURRENT_DESKTOP", "Aura")
             .env("XDG_SESSION_TYPE", "wayland")
             .env_remove("AURA_CAPTURE_SOCKET")
             .env_remove("AURA_CAPTURE_TOKEN")
             .env_remove("AURA_CAPTURE_OWNER_PID");
+        if let Some(display) = &x_display {
+            command.env("DISPLAY", display).env_remove("XAUTHORITY");
+        }
         match ManagedChild::spawn("aura-shell", &mut command) {
             Ok(child) => Some(child),
             Err(error) => {
@@ -471,6 +614,96 @@ mod tests {
             panic!("run expected")
         };
         assert_eq!(options.backend, "drm");
+        let ParseResult::Run(options) = parse(&["--xwayland"]).unwrap() else {
+            panic!("run expected")
+        };
+        assert!(options.xwayland);
+        let ParseResult::Run(options) = parse(&["--xwayland", "--no-xwayland"]).unwrap() else {
+            panic!("run expected")
+        };
+        assert!(!options.xwayland);
+    }
+
+    #[test]
+    fn readiness_requires_the_ready_flag_and_a_local_display() {
+        assert_eq!(
+            xwayland_display(r#"{"xwayland_ready":false,"xwayland_display":":9"}"#).unwrap(),
+            None
+        );
+        assert_eq!(
+            xwayland_display(r#"{"xwayland_ready":true,"xwayland_display":":9"}"#).unwrap(),
+            Some(":9".into())
+        );
+        for response in [
+            r#"{"xwayland_ready":true,"xwayland_display":null}"#,
+            r#"{"xwayland_ready":true,"xwayland_display":"host:9"}"#,
+            r#"{"xwayland_ready":true,"xwayland_display":":"}"#,
+            r#"{"xwayland_ready":true,"xwayland_display":":1.0"}"#,
+            r#"{"xwayland_ready":true,"xwayland_display":":4294967296"}"#,
+            "not json",
+        ] {
+            assert_eq!(
+                xwayland_display(response).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn xwayland_readiness_waits_for_the_window_manager_status() {
+        let root =
+            std::env::temp_dir().join(format!("aura-xwayland-ready-test-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let control = root.join("control.sock");
+        let listener = UnixListener::bind(&control).unwrap();
+        let responder = tokio::spawn(async move {
+            for ready in [false, true] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut request = String::new();
+                stream.read_line(&mut request).await.unwrap();
+                assert_eq!(request, "status\n");
+                let response =
+                    format!("{{\"xwayland_ready\":{ready},\"xwayland_display\":\":19\"}}\n");
+                stream
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 60"]);
+        let mut child = ManagedChild::spawn("test", &mut command).unwrap();
+        let result = wait_for_xwayland(&mut child, &control, Duration::from_secs(1)).await;
+        child.stop().await;
+        responder.await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(result.unwrap(), ":19");
+    }
+
+    #[tokio::test]
+    async fn silent_xwayland_status_respects_the_startup_deadline() {
+        let root =
+            std::env::temp_dir().join(format!("aura-xwayland-silent-test-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let control = root.join("control.sock");
+        let listener = UnixListener::bind(&control).unwrap();
+        let responder = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 60"]);
+        let mut child = ManagedChild::spawn("test", &mut command).unwrap();
+        let start = Instant::now();
+        let result = wait_for_xwayland(&mut child, &control, Duration::from_millis(50)).await;
+        child.stop().await;
+        responder.abort();
+        let _ = responder.await;
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]

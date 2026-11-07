@@ -9,6 +9,8 @@ mod native;
 mod native_render_tests;
 mod runtime;
 mod scene;
+#[cfg(feature = "xwayland")]
+mod xwayland;
 
 use aura_core::GlassQualityPreset;
 use std::{env, error::Error};
@@ -29,10 +31,12 @@ impl Backend {
     }
 }
 
-const HELP: &str = "aura-compositor [--backend winit|drm] [--socket NAME] [--smoke-test]\n\
+const HELP: &str = "aura-compositor [--backend winit|drm] [--socket NAME] [--smoke-test] [--xwayland]\n\
 Configure with AURA_BACKEND, AURA_OUTPUT_SCALE (integer), AURA_GLASS_QUALITY.\n\
 winit runs inside an existing X11/Wayland desktop and accepts AURA_WINIT_RESOLUTION.\n\
-Experimental drm requires a Linux seat, DRM/KMS hardware and a build with --features native.";
+Experimental drm requires a Linux seat, DRM/KMS hardware and a build with --features native.\n\
+X11 applications require --xwayland (or AURA_XWAYLAND=1), Xwayland installed and a build with --features xwayland.\n\
+Use --no-xwayland or AURA_XWAYLAND=0 to disable it.";
 
 #[derive(Debug)]
 pub(crate) struct Config {
@@ -42,12 +46,14 @@ pub(crate) struct Config {
     pub scale: i32,
     pub quality: GlassQualityPreset,
     pub smoke: bool,
+    pub xwayland: bool,
 }
 
 fn parse_config(
     args: impl IntoIterator<Item = String>,
     environment: impl Fn(&str) -> Option<String>,
     native_available: bool,
+    xwayland_available: bool,
 ) -> Result<Option<Config>, Box<dyn Error>> {
     let mut backend = environment("AURA_BACKEND").unwrap_or_else(|| "winit".into());
     let mut config = Config {
@@ -67,6 +73,11 @@ fn parse_config(
             other => return Err(format!("invalid AURA_GLASS_QUALITY: {other}").into()),
         },
         smoke: false,
+        xwayland: match environment("AURA_XWAYLAND").as_deref() {
+            None | Some("0") => false,
+            Some("1") => true,
+            Some(_) => return Err("AURA_XWAYLAND must be 0 or 1".into()),
+        },
     };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -74,11 +85,16 @@ fn parse_config(
             "--backend" => backend = args.next().ok_or("--backend requires a value")?,
             "--socket" => config.socket = args.next().ok_or("--socket requires a value")?,
             "--smoke-test" => config.smoke = true,
+            "--xwayland" => config.xwayland = true,
+            "--no-xwayland" => config.xwayland = false,
             "--help" | "-h" => return Ok(None),
             other => return Err(format!("unknown argument: {other}").into()),
         }
     }
     config.backend = Backend::parse(&backend)?;
+    if config.xwayland && !xwayland_available {
+        return Err("XWayland requires an aura-compositor build with --features xwayland".into());
+    }
     if config.backend == Backend::Drm && !native_available {
         return Err(
             "the drm backend requires an aura-compositor build with --features native".into(),
@@ -114,11 +130,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         env::args().skip(1),
         |name| env::var(name).ok(),
         cfg!(feature = "native"),
+        cfg!(feature = "xwayland"),
     )?
     else {
         println!("{HELP}");
         return Ok(());
     };
+    if config.xwayland {
+        // X11's filesystem listener is bound before spawning the server. Set
+        // privacy before any compositor threads exist, including under umask 0.
+        // Shell/application processes are supervisor siblings and keep their mask.
+        use smithay::reexports::rustix::{fs::Mode, process::umask};
+        let private = Mode::from_raw_mode(0o077);
+        let inherited = umask(private);
+        umask(inherited | private);
+    }
     runtime::run(config)
 }
 
@@ -131,6 +157,15 @@ mod tests {
         variables: &[(&str, &str)],
         native: bool,
     ) -> Result<Option<Config>, Box<dyn Error>> {
+        parse_available(args, variables, native, false)
+    }
+
+    fn parse_available(
+        args: &[&str],
+        variables: &[(&str, &str)],
+        native: bool,
+        xwayland: bool,
+    ) -> Result<Option<Config>, Box<dyn Error>> {
         parse_config(
             args.iter().map(|value| (*value).into()),
             |name| {
@@ -140,6 +175,7 @@ mod tests {
                     .map(|(_, value)| (*value).into())
             },
             native,
+            xwayland,
         )
     }
 
@@ -191,5 +227,34 @@ mod tests {
             assert!(parse(&args, &[], true).is_err(), "{args:?}");
         }
         assert!(parse(&["--help"], &[], false).unwrap().is_none());
+    }
+
+    #[test]
+    fn xwayland_is_opt_in_and_requires_a_build_with_the_feature() {
+        assert!(!parse(&[], &[], false).unwrap().unwrap().xwayland);
+        for (args, variables) in [
+            (vec!["--xwayland"], vec![]),
+            (vec![], vec![("AURA_XWAYLAND", "1")]),
+        ] {
+            assert!(
+                parse(&args, &variables, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("--features xwayland")
+            );
+            assert!(
+                parse_available(&args, &variables, false, true)
+                    .unwrap()
+                    .unwrap()
+                    .xwayland
+            );
+        }
+        assert!(
+            !parse(&["--no-xwayland"], &[("AURA_XWAYLAND", "1")], false)
+                .unwrap()
+                .unwrap()
+                .xwayland
+        );
+        assert!(parse(&[], &[("AURA_XWAYLAND", "yes")], false).is_err());
     }
 }

@@ -11,6 +11,10 @@ the nested path. It uses libseat, GBM/EGL and libinput, but still requires targe
 hardware validation. The default session remains nested. See the
 [native backend build, launch and validation notes](docs/native-backend.md).
 
+Optional rootless XWayland support runs X11 applications within Aura's desktop.
+Build with `--features aura-compositor/xwayland` and start the session with
+`--xwayland`; see [XWayland setup and validation](docs/xwayland.md).
+
 ## Screenshots
 
 Captured from a running nested session with Mesa software rendering. The windows, launcher entries and notifications shown here are development samples.
@@ -44,6 +48,8 @@ Rust **1.99.1** is pinned in `rust-toolchain.toml`. Install Rust with rustup usi
 sudo bash scripts/install-deps.sh --testing
 # Optional DRM/input/session/PipeWire build dependencies:
 sudo bash scripts/install-deps.sh --native --testing
+# Optional X11 application compatibility server:
+sudo bash scripts/install-deps.sh --testing --xwayland
 
 cargo build --workspace --locked
 ```

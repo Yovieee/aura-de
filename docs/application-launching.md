@@ -27,6 +27,12 @@ an available `Exec` command is used if activation fails. Valid D-Bus-only entrie
 do not need `Exec`. The current UI launches applications without files; `Open`
 and desktop action selection remain separate work.
 
+An optional `--xwayland` session gives Exec-launched X11 applications Aura's own
+`DISPLAY`. An existing D-Bus service keeps its own environment; Aura does not
+rewrite the activation environment of a shared session bus. See
+[XWayland setup and scope](xwayland.md) when testing an X11 application's launch
+route.
+
 For `Terminal=true`, the command runs through an available supported terminal.
 Set `AURA_TERMINAL` to choose a terminal or wrapper explicitly:
 
