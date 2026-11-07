@@ -25,15 +25,16 @@ def verify_toml_manifests() -> None:
     print("PASS: workspace manifests and core dependency boundary")
 
 
-def verify_paths() -> None:
-    for path in (ROOT / "crates").rglob("*.rs"):
+def verify_paths(root: Path = ROOT) -> None:
+    for path in (root / "crates").rglob("*.rs"):
         source = path.read_text()
         for match in re.finditer(
-            r"(?P<attributes>(?:#\[[^\n]*\]\s*)*)(?:pub\s+)?mod\s+(?P<name>[A-Za-z0-9_]+)\s*;",
+            r"(?P<attributes>(?:#\[[^\]]*\]\s*)*)"
+            r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*;",
             source,
         ):
             name = match.group("name")
-            explicit = re.search(r'#\[path\s*=\s*"([^\"]+)"\]', match.group("attributes"))
+            explicit = re.search(r'#\[\s*path\s*=\s*"([^"]+)"\s*\]', match.group("attributes"))
             candidates = [path.parent / explicit.group(1)] if explicit else [
                 path.parent / f"{name}.rs", path.parent / name / "mod.rs",
             ]
